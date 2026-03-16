@@ -1,11 +1,18 @@
 """
-Microserviço de Extração Fiscal v2.2
+Microserviço de Extração Fiscal v2.3
 =====================================
 Três camadas: Determinístico → Regex → Semântico (LLM)
 Mapeado para a estrutura REAL das tabelas no Supabase.
 
-v2.2 — Adicionado pipeline de upsert dos JSONs estruturados
-        de ICMS-ST (Anexos RICMS/MA) a partir do Google Drive.
+v2.3 — Pipeline upsert ICMS-ST completamente reescrito:
+        • Suporta formato A (seções como list[]) e formato B (seções como dict{registros:[]})
+        • Normaliza aliases de campos (orgao→orgao_emissor, texto_ementa/descricao→ementa)
+        • Ignora campos fora do schema com log (nunca aborta)
+        • Resolve placeholders <FK_REF> em runtime com mapeamento por arquivo
+        • Detecta e trata campos duplicados com mesmo propósito (log + mantém um)
+        • Aceita ncm/cest null, ncm com texto livre ('Diversas','61','3003; 3004')
+        • Aceita artigos=[], signatarios_ativos=null, vigencia_inicio por produto
+        • UUID como PK — nunca usa (cest,ncm) como chave única
 """
 
 import os, re, io, json, base64, logging
@@ -32,7 +39,6 @@ SUPABASE_KEY            = os.getenv("SUPABASE_KEY", "")
 OPENAI_API_KEY          = os.getenv("OPENAI_API_KEY", "")
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
 DRIVE_FOLDER_ID         = os.getenv("DRIVE_FOLDER_ID", "")
-# Pasta do Drive com os 4 arquivos JSON dos Anexos RICMS/MA
 DRIVE_FOLDER_ID_JSONS   = os.getenv("DRIVE_FOLDER_ID_JSONS", "")
 
 # ── Imports opcionais ─────────────────────────────────────────────────────────
@@ -56,7 +62,7 @@ try:
 except: HAS_GDRIVE = False
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Extrator Fiscal v2.2", version="2.2.0")
+app = FastAPI(title="Extrator Fiscal v2.3", version="2.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -355,7 +361,7 @@ def extrair_regex(texto, regime, segmento, fonte):
         for nr in RE_NCM.findall(linha):
             ncm = limpar_ncm(nr)
             if not ncm: continue
-            ctx   = " ".join(linhas[max(0, i-2):i+3])
+            ctx    = " ".join(linhas[max(0, i-2):i+3])
             cest_m = RE_CEST.search(ctx)
             partes = linha.split(nr, 1)
             desc   = partes[1].strip()[:300] if len(partes) > 1 else None
@@ -552,7 +558,7 @@ def _svc():
 @app.get("/health")
 def health():
     return {
-        "status": "ok", "versao": "2.2.0",
+        "status": "ok", "versao": "2.3.0",
         "supabase": supabase is not None,
         "pdf": HAS_PDF, "xlsx": HAS_XLSX, "docx": HAS_DOCX, "gdrive": HAS_GDRIVE,
     }
@@ -623,11 +629,11 @@ async def _pasta(folder_id):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# UPSERT JSONs ICMS-ST — Anexos RICMS/MA
+# UPSERT JSONs ICMS-ST  v2.3
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Ordem de inserção respeitando FKs
-_TABLE_ORDER_ICMS = [
+# ── Ordem de inserção respeitando FKs ────────────────────────────────────────
+_TABLE_ORDER = [
     "normas_legais",
     "anexos_fiscais",
     "anexos_artigos",
@@ -637,22 +643,63 @@ _TABLE_ORDER_ICMS = [
     "produtos_icms_st",
 ]
 
-# Chaves únicas por tabela (on_conflict)
-_UNIQUE_KEYS_ICMS = {
-    "normas_legais":              ["tipo", "numero", "orgao_emissor"],
-    "anexos_fiscais":             ["sigla_anexo", "estado"],
-    "anexos_artigos":             ["anexo_id", "numero"],
-    "anexos_pontos_atencao":      ["anexo_id", "descricao"],
-    "anexos_comparativo_redacao": ["anexo_id", "artigo", "dispositivo"],
-    "anexos_normas":              ["anexo_id", "norma_id"],
-    "produtos_icms_st":           ["ncm", "cest", "anexo_fiscal_id"],
+# ── Colunas aceitas por tabela (schema real do Supabase) ─────────────────────
+_SCHEMA_COLS: dict[str, set] = {
+    "normas_legais": {
+        "tipo", "numero", "ano", "orgao_emissor", "ambito",
+        "data_publicacao", "data_vigencia_inicio", "data_vigencia_fim",
+        "ementa", "dispositivos_afetados", "ato",
+    },
+    "anexos_fiscais": {
+        "estado", "orgao", "nome_completo", "sigla_anexo", "regulamento",
+        "produto_principal", "data_inicio_vigencia_estado", "ultima_alteracao_norma",
+        "data_inicio_ultima_alteracao", "signatarios_ativos", "ex_signatarios", "ementa",
+    },
+    "anexos_artigos": {
+        "anexo_id", "numero", "secao", "epigrafe", "resumo",
+        "texto_chave", "paragrafos_incisos",
+    },
+    "anexos_pontos_atencao": {"anexo_id", "descricao", "tema"},
+    "anexos_comparativo_redacao": {
+        "anexo_id", "artigo", "dispositivo", "redacao_anterior",
+        "redacao_vigente", "data_mudanca", "norma_que_alterou",
+    },
+    "anexos_normas": {"anexo_id", "norma_id", "papel"},
+    "produtos_icms_st": {
+        "segmento", "cest", "ncm", "descricao", "fundamentacao_convenio",
+        "fundamentacao_ricms", "cst_icms", "csosn", "cfop_interno", "cfop_externo",
+        "cst", "cfop_interestadual", "vigencia_inicio", "vigencia_fim", "ativo",
+        "norma_legal_id", "descricao_cst", "fonte_arquivo", "metodo_extracao",
+        "anexo_fiscal_id",
+        # user_id é opcional — preenchido pela aplicação, nunca pelos JSONs
+    },
 }
 
-# Defaults para campos nulos
-_DEFAULTS_ICMS = {
+# ── Aliases: campo_no_json → campo_no_schema ─────────────────────────────────
+# Quando o JSON usa um nome diferente do schema, renomear silenciosamente.
+# Se o mesmo registro tiver AMBOS (original + alias), manter o do schema e
+# logar o conflito — nunca abortar.
+_FIELD_ALIASES: dict[str, dict[str, str]] = {
     "normas_legais": {
-        "situacao": "ATIVO",
-        "ambito":   "Federal",
+        "orgao":        "orgao_emissor",   # lotes 4-5: alguns JSONs usam 'orgao'
+        "texto_ementa": "ementa",          # lotes 4-5: alguns JSONs usam 'texto_ementa'
+        "descricao":    "ementa",          # lotes 4-5: alguns JSONs usam 'descricao' no lugar de ementa
+    },
+    # anexos_fiscais não precisa — 'orgao' já é o nome correto na tabela
+}
+
+# ── Campos a ignorar completamente (fora do schema, sem alias útil) ──────────
+_IGNORE_FIELDS = frozenset({
+    # Campos de controle/metadados dos JSONs
+    "situacao", "status", "esfera", "revogada",
+    # Campos extras identificados na auditoria
+    "dispositivos_impactados", "ncm_produto",
+})
+
+# ── Defaults quando o campo obrigatório estiver ausente/nulo ─────────────────
+_DEFAULTS: dict[str, dict] = {
+    "normas_legais": {
+        "ambito": "Federal",
     },
     "anexos_fiscais": {
         "estado":      "MA",
@@ -669,57 +716,151 @@ _DEFAULTS_ICMS = {
     },
 }
 
-_PH_RE = re.compile(r"^<[A-Z_0-9]+>$")
+# ── Regex para detectar placeholder de FK ────────────────────────────────────
+_PH_RE = re.compile(r"^<[A-Z0-9_]+>$")
+
+def _is_placeholder(v) -> bool:
+    return isinstance(v, str) and bool(_PH_RE.match(v))
+
+def _is_blank(v) -> bool:
+    if v is None: return True
+    if isinstance(v, str) and (v.strip() == "" or _is_placeholder(v)): return True
+    return False
 
 
-class _PlaceholderResolver:
+# ── Resolver de placeholders → UUIDs reais ───────────────────────────────────
+class _Resolver:
     """
-    Mantém mapa placeholder→UUID real.
-    Ex.: "<ANEXO_ID_4_28>" → "uuid-real-do-supabase"
+    Mantém mapa placeholder → UUID real por arquivo.
+    Registra e resolve chaves como '<ANEXO_ID_4_28>' → 'uuid-real'.
     """
-    def __init__(self):
-        self._map: dict = {}
+    def __init__(self, filename: str):
+        self._map: dict[str, str] = {}
+        self._file = filename
 
     def register(self, placeholder: str, real_id: str):
         if placeholder and real_id:
             self._map[placeholder] = real_id
+            log.info(f"[icms] {self._file} — registrado {placeholder} = {real_id[:8]}…")
 
     def resolve(self, value):
-        if isinstance(value, str) and value.startswith("<") and value.endswith(">"):
+        if _is_placeholder(value):
             resolved = self._map.get(value)
             if resolved is None:
-                log.warning(f"[icms_json] placeholder não resolvido: {value}")
+                log.warning(f"[icms] {self._file} — placeholder não resolvido: {value}")
             return resolved
         return value
 
-    def resolve_record(self, record: dict) -> dict:
+    def resolve_all(self, record: dict) -> dict:
         return {k: self.resolve(v) for k, v in record.items()}
 
 
-def _is_empty(val) -> bool:
-    if val is None: return True
-    if isinstance(val, str) and (val.strip() == "" or _PH_RE.match(val)): return True
-    return False
+# ── Normalização de um registro ───────────────────────────────────────────────
+def _normalizar_registro(table: str, raw: dict, filename: str) -> dict:
+    """
+    1. Remove chaves com prefixo '_' (metadados internos)
+    2. Aplica aliases de campo (orgao → orgao_emissor, etc.)
+       — se o campo destino JÁ existir, mantém o do schema e loga o conflito
+    3. Remove campos fora do schema + lista de ignorados
+    4. Aplica defaults para campos obrigatórios ausentes/nulos
+    5. Retorna apenas colunas aceitas pelo schema
+    """
+    result = {}
+    aliases = _FIELD_ALIASES.get(table, {})
+    schema  = _SCHEMA_COLS.get(table, set())
 
-def _aplicar_defaults(table: str, record: dict) -> dict:
-    for field, default_val in _DEFAULTS_ICMS.get(table, {}).items():
-        if _is_empty(record.get(field)):
-            record[field] = default_val
-    return record
+    for key, val in raw.items():
+        # 1. Ignorar chaves internas (_tabela, _operacao, _id_referencia, _nota…)
+        if key.startswith("_"):
+            continue
 
-def _strip_meta_keys(record: dict) -> dict:
-    return {k: v for k, v in record.items() if not k.startswith("_")}
+        # 2. Campos a ignorar explicitamente
+        if key in _IGNORE_FIELDS:
+            log.debug(f"[icms] {filename}/{table}: campo ignorado '{key}'")
+            continue
+
+        # 3. Aplicar alias
+        target_key = aliases.get(key, key)
+
+        if target_key != key:
+            # É um alias — verificar se o campo destino já foi preenchido pelo
+            # próprio registro (conflito: dois campos com o mesmo propósito)
+            if target_key in result:
+                log.warning(
+                    f"[icms] {filename}/{table}: campo duplicado — "
+                    f"'{key}' é alias de '{target_key}' que já existe. "
+                    f"Mantendo '{target_key}' = {repr(result[target_key])!r:.60s}, "
+                    f"ignorando '{key}' = {repr(val)!r:.60s}"
+                )
+                continue
+            key = target_key
+
+        # 4. Fora do schema → logar e ignorar
+        if key not in schema:
+            log.warning(
+                f"[icms] {filename}/{table}: campo '{key}' fora do schema — ignorado"
+            )
+            continue
+
+        result[key] = val
+
+    # 5. Aplicar defaults para campos ausentes/nulos
+    for field, default_val in _DEFAULTS.get(table, {}).items():
+        if _is_blank(result.get(field)):
+            result[field] = default_val
+
+    return result
 
 
-def _upsert_row(table: str, row: dict, conflict_cols: list, resolver: _PlaceholderResolver):
-    """Resolve FKs, aplica defaults e persiste. Retorna id gerado ou None."""
-    row = resolver.resolve_record(row)
-    row = _strip_meta_keys(row)
-    row = _aplicar_defaults(table, row)
+# ── Extração de seções (formato A=lista, formato B=dict{registros}) ──────────
+def _extrair_rows(section) -> list[dict]:
+    """
+    Aceita qualquer dos formatos encontrados nos 26 JSONs:
+      - list[dict]                → formato padrão (24 arquivos)
+      - dict{registros: list}     → formato alternativo (4.16, 4.17, 4.19)
+      - dict direto (um registro) → formato singular
+      - None / vazio              → lista vazia
+    """
+    if not section:
+        return []
+    if isinstance(section, list):
+        return [r for r in section if isinstance(r, dict)]
+    if isinstance(section, dict):
+        if "registros" in section:
+            regs = section["registros"]
+            return [r for r in regs if isinstance(r, dict)] if isinstance(regs, list) else []
+        # dict direto sem 'registros' — tratar como registro único se tiver campos de dados
+        if any(k in section for k in _SCHEMA_COLS.get("anexos_fiscais", set())):
+            return [section]
+    return []
 
+
+# ── Inserção de um único registro com tratamento de erro ────────────────────
+def _upsert_row(
+    table: str,
+    row: dict,
+    conflict_cols: list[str],
+    resolver: _Resolver,
+    filename: str,
+) -> str | None:
+    """
+    Resolve FKs → normaliza → valida colunas de conflito → upsert.
+    Retorna o UUID gerado ou None em caso de falha.
+    NUNCA levanta exceção — sempre loga e continua.
+    """
+    # Resolver placeholders de FK
+    row = resolver.resolve_all(row)
+
+    # Normalizar campos
+    row = _normalizar_registro(table, row, filename)
+
+    # Validar que as colunas de conflito estão presentes e não são None
     for col in conflict_cols:
         if row.get(col) is None:
-            log.warning(f"[icms_json] {table}: coluna de conflict '{col}' é None — ignorado")
+            log.warning(
+                f"[icms] {filename}/{table}: coluna de conflict '{col}' é None "
+                f"— registro ignorado: {list(row.items())[:4]}"
+            )
             return None
 
     try:
@@ -729,43 +870,77 @@ def _upsert_row(table: str, row: dict, conflict_cols: list, resolver: _Placehold
             .execute()
         )
         data = resp.data
-        if data:
+        if data and isinstance(data, list) and len(data) > 0:
             return data[0].get("id")
-        log.warning(f"[icms_json] {table}: upsert sem retorno para {row}")
+        log.warning(f"[icms] {filename}/{table}: upsert sem retorno de id — {list(row.items())[:3]}")
         return None
     except Exception as e:
-        log.error(f"[icms_json] {table} erro: {e}")
+        log.error(f"[icms] {filename}/{table}: erro no upsert — {e} | dados: {list(row.items())[:4]}")
         return None
 
 
-def _processar_bloco(data: dict, label: str, resolver: _PlaceholderResolver) -> dict:
-    """Itera pelas 7 tabelas de um bloco JSON e faz upsert em ordem."""
-    contadores = {t: 0 for t in _TABLE_ORDER_ICMS}
-    erros: list = []
+# ── Chaves de conflito por tabela ────────────────────────────────────────────
+# Usamos apenas colunas que identificam univocamente o registro para o ON CONFLICT.
+# Para produtos_icms_st a PK é UUID — não há constraint de unicidade em (cest,ncm).
+# Por isso usamos apenas 'ncm,cest,anexo_fiscal_id' como melhor aproximação,
+# mas só quando todos os três estiverem presentes; caso contrário INSERT puro.
+_CONFLICT_COLS: dict[str, list[str]] = {
+    "normas_legais":              ["tipo", "numero", "orgao_emissor"],
+    "anexos_fiscais":             ["sigla_anexo", "estado"],
+    "anexos_artigos":             ["anexo_id", "numero"],
+    "anexos_pontos_atencao":      ["anexo_id", "descricao"],
+    "anexos_comparativo_redacao": ["anexo_id", "artigo", "dispositivo"],
+    "anexos_normas":              ["anexo_id", "norma_id"],
+    "produtos_icms_st":           [],   # INSERT puro — UUID gerado pelo Supabase
+}
 
-    meta = data.get("_meta", {})
-    log.info(f"[icms_json] '{label}' — {meta.get('descricao', 'sem descrição')}")
 
-    for table in _TABLE_ORDER_ICMS:
-        rows = data.get(table)
+def _processar_bloco(data: dict, filename: str, resolver: _Resolver) -> dict:
+    """
+    Itera as 7 tabelas de um bloco JSON e faz upsert em ordem.
+    Retorna contadores e lista de erros para log.
+    """
+    contadores = {t: 0 for t in _TABLE_ORDER}
+    erros: list[str] = []
+
+    for table in _TABLE_ORDER:
+        rows = _extrair_rows(data.get(table))
         if not rows:
             continue
-        if isinstance(rows, dict):
-            rows = [rows]
 
-        conflict_cols = _UNIQUE_KEYS_ICMS[table]
+        conflict_cols = _CONFLICT_COLS[table]
+        log.info(f"[icms] {filename}/{table}: {len(rows)} registro(s)")
 
         for row in rows:
-            placeholder = row.get("_id_referencia")
-            real_id = _upsert_row(table, dict(row), conflict_cols, resolver)
+            placeholder = row.get("_id_referencia")  # antes da normalização
 
-            if real_id and placeholder:
-                resolver.register(placeholder, real_id)
+            if conflict_cols:
+                real_id = _upsert_row(table, dict(row), conflict_cols, resolver, filename)
+            else:
+                # produtos_icms_st: INSERT puro (sem on_conflict) — UUID pelo Supabase
+                row_norm = resolver.resolve_all(dict(row))
+                row_norm = _normalizar_registro(table, row_norm, filename)
+                try:
+                    resp = supabase.table(table).insert(row_norm).execute()
+                    data_resp = resp.data
+                    real_id = data_resp[0].get("id") if data_resp else None
+                except Exception as e:
+                    log.error(f"[icms] {filename}/{table}: insert erro — {e}")
+                    real_id = None
 
             if real_id:
+                # Registrar no resolver para que FKs subsequentes sejam resolvidas
+                if placeholder:
+                    resolver.register(placeholder, real_id)
                 contadores[table] += 1
             else:
-                ref = placeholder or row.get("ncm") or row.get("sigla_anexo") or "?"
+                ref = (
+                    placeholder
+                    or row.get("ncm")
+                    or row.get("sigla_anexo")
+                    or row.get("descricao", "")[:40]
+                    or "?"
+                )
                 erros.append(f"{table}:{ref}")
 
     return {"contadores": contadores, "erros": erros}
@@ -773,65 +948,68 @@ def _processar_bloco(data: dict, label: str, resolver: _PlaceholderResolver) -> 
 
 def _normalizar_blocos(data) -> list[dict]:
     """
-    Normaliza qualquer estrutura JSON para lista de blocos,
-    cada um com as 7 tabelas no topo.
+    Normaliza a raiz do JSON para lista de blocos independentes.
 
     Suporta:
-      - dict direto com tabelas no topo  (anexo_4_28_racoes.json)
-      - dict de anexos {"ANEXO_4_37": {...}, ...}  (anexos_4_37_4_38_4_41.json)
-      - lista de blocos
+      • dict direto com tabelas no topo           → 1 bloco  (maioria dos arquivos)
+      • dict wrapper com sub-dicts por anexo       → N blocos (arquivos multi-anexo)
+      • list de blocos
     """
     if isinstance(data, list):
         return [b for b in data if isinstance(b, dict)]
 
     if isinstance(data, dict):
-        # Arquivo direto — tem pelo menos uma tabela-alvo no topo
-        if any(k in data for k in _TABLE_ORDER_ICMS):
+        # Arquivo com pelo menos uma tabela-alvo no topo → 1 bloco
+        if any(k in data for k in _TABLE_ORDER):
             return [data]
-        # Wrapper com múltiplos anexos como sub-dicts
-        blocos = []
-        for key, block in data.items():
-            if isinstance(block, dict) and any(t in block for t in _TABLE_ORDER_ICMS):
-                blocos.append(block)
+        # Wrapper: cada chave é um anexo {"ANEXO_4_37": {...}, ...}
+        blocos = [
+            block for key, block in data.items()
+            if isinstance(block, dict) and any(t in block for t in _TABLE_ORDER)
+        ]
         return blocos
 
     return []
 
 
+# ── Task principal em background ─────────────────────────────────────────────
 async def _run_upsert_icms_jsons(folder_id: str):
-    """Task em background: baixa JSONs do Drive e faz upsert nas 7 tabelas."""
+    """Baixa todos os JSONs da pasta do Drive e faz upsert nas 7 tabelas."""
     svc = _svc()
     if not svc:
-        log.error("[icms_json] Falha na autenticação Google Drive")
+        log.error("[icms] Falha na autenticação Google Drive")
         return
 
     try:
         files = (
             svc.files()
             .list(
-                q=f"'{folder_id}' in parents "
-                  f"and mimeType='application/json' "
-                  f"and trashed=false",
+                q=(
+                    f"'{folder_id}' in parents "
+                    f"and mimeType='application/json' "
+                    f"and trashed=false"
+                ),
                 fields="files(id, name)",
-                pageSize=50,
+                pageSize=100,
             )
             .execute()
             .get("files", [])
         )
     except Exception as e:
-        log.error(f"[icms_json] Listar pasta Drive: {e}")
+        log.error(f"[icms] Listar pasta Drive: {e}")
         return
 
-    log.info(f"[icms_json] {len(files)} arquivo(s) JSON encontrado(s) na pasta {folder_id}")
+    log.info(f"[icms] {len(files)} arquivo(s) JSON na pasta {folder_id}")
 
-    total_geral = {t: 0 for t in _TABLE_ORDER_ICMS}
-    erros_geral: list = []
+    total  = {t: 0 for t in _TABLE_ORDER}
+    erros_geral: list[str] = []
 
     for file_meta in files:
         file_id  = file_meta["id"]
         filename = file_meta["name"]
-        log.info(f"[icms_json] baixando '{filename}' (id={file_id})...")
+        log.info(f"[icms] baixando '{filename}'…")
 
+        # Download
         try:
             buf = io.BytesIO()
             dl  = MediaIoBaseDownload(buf, svc.files().get_media(fileId=file_id))
@@ -840,28 +1018,33 @@ async def _run_upsert_icms_jsons(folder_id: str):
                 _, done = dl.next_chunk()
             data = json.loads(buf.getvalue().decode("utf-8"))
         except Exception as e:
-            log.error(f"[icms_json] Falha ao baixar '{filename}': {e}")
-            erros_geral.append(f"download:{filename}:{e}")
+            log.error(f"[icms] Falha ao baixar '{filename}': {e}")
+            erros_geral.append(f"download:{filename}")
             continue
 
         # Resolver é por arquivo — cada JSON tem seus próprios placeholders
-        resolver = _PlaceholderResolver()
+        resolver = _Resolver(filename)
         blocos   = _normalizar_blocos(data)
 
         if not blocos:
-            log.warning(f"[icms_json] '{filename}': nenhum bloco reconhecível encontrado")
+            log.warning(f"[icms] '{filename}': nenhum bloco reconhecível — ignorado")
             continue
 
         for bloco in blocos:
             resultado = _processar_bloco(bloco, filename, resolver)
             for t, n in resultado["contadores"].items():
-                total_geral[t] += n
+                total[t] += n
             erros_geral.extend(resultado["erros"])
 
-    log.info(f"[icms_json] ✓ CONCLUÍDO — totais por tabela: {total_geral}")
+    # Resumo final
+    log.info(f"[icms] ✓ CONCLUÍDO — totais: {total}")
     if erros_geral:
-        log.warning(f"[icms_json] {len(erros_geral)} falha(s): {erros_geral[:20]}")
+        log.warning(f"[icms] {len(erros_geral)} falha(s): {erros_geral[:30]}")
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENDPOINTS — ICMS-ST
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/upsert-icms-st")
 async def upsert_icms_st(
@@ -869,7 +1052,7 @@ async def upsert_icms_st(
     folder_id: Optional[str] = None,
 ):
     """
-    Lê os arquivos JSON dos Anexos RICMS/MA de uma pasta do Google Drive
+    Lê os JSONs dos Anexos RICMS/MA de uma pasta do Google Drive
     e faz upsert nas 7 tabelas do Supabase na ordem correta:
 
       normas_legais → anexos_fiscais → anexos_artigos →
@@ -877,7 +1060,7 @@ async def upsert_icms_st(
       anexos_normas → produtos_icms_st
 
     Query param opcional:
-      ?folder_id=<ID_DA_PASTA>   (usa DRIVE_FOLDER_ID_JSONS do env se omitido)
+      ?folder_id=<ID_DA_PASTA>   (usa DRIVE_FOLDER_ID_JSONS do .env se omitido)
     """
     if not supabase:
         raise HTTPException(503, "Supabase não configurado")
@@ -895,18 +1078,18 @@ async def upsert_icms_st(
     return {
         "status":    "iniciado",
         "folder_id": fid,
-        "tabelas":   _TABLE_ORDER_ICMS,
+        "tabelas":   _TABLE_ORDER,
         "info":      "Acompanhe os logs do Railway para progresso detalhado",
     }
 
 
 @app.get("/status-icms-st")
 def status_icms_st():
-    """Retorna contagem de registros nas 7 tabelas do pipeline ICMS-ST."""
+    """Contagem de registros nas 7 tabelas do pipeline ICMS-ST."""
     if not supabase:
         return {"erro": "Supabase não configurado"}
     resultado = {}
-    for table in _TABLE_ORDER_ICMS:
+    for table in _TABLE_ORDER:
         try:
             resp = supabase.table(table).select("id", count="exact").execute()
             resultado[table] = resp.count
