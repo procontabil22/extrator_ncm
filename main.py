@@ -515,8 +515,18 @@ async def extrair_ncms(req:ExtrairRequest):
 def _svc():
     if not HAS_GDRIVE: return None
     try:
-        creds=service_account.Credentials.from_service_account_file(
-            GOOGLE_CREDENTIALS_PATH,scopes=["https://www.googleapis.com/auth/drive.readonly"])
+        import json, tempfile
+        creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+        if creds_json:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+                f.write(creds_json)
+                tmp_path = f.name
+            creds = service_account.Credentials.from_service_account_file(
+                tmp_path, scopes=["https://www.googleapis.com/auth/drive.readonly"])
+        else:
+            creds = service_account.Credentials.from_service_account_file(
+                GOOGLE_CREDENTIALS_PATH,
+                scopes=["https://www.googleapis.com/auth/drive.readonly"])
         return build("drive","v3",credentials=creds)
     except Exception as e: log.error(f"Drive: {e}"); return None
 
