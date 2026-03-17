@@ -646,7 +646,7 @@ _TABLE_ORDER = [
 # ── Colunas aceitas por tabela (schema real do Supabase) ─────────────────────
 _SCHEMA_COLS: dict[str, set] = {
     "normas_legais": {
-        "tipo", "numero", "ano", "orgao_emissor", "ambito",
+        "tipo", "numero", "ano", "orgao_emissor",
         "data_publicacao", "data_vigencia_inicio", "data_vigencia_fim",
         "ementa", "dispositivos_afetados", "ato",
     },
@@ -699,7 +699,6 @@ _IGNORE_FIELDS = frozenset({
 # ── Defaults quando o campo obrigatório estiver ausente/nulo ─────────────────
 _DEFAULTS: dict[str, dict] = {
     "normas_legais": {
-        "ambito": "Federal",
     },
     "anexos_fiscais": {
         "estado":      "MA",
@@ -836,6 +835,34 @@ def _extrair_rows(section) -> list[dict]:
 
 
 # ── Inserção de um único registro com tratamento de erro ────────────────────
+# Campos que são FK uuid — não podem conter strings placeholder
+_UUID_FK_FIELDS = frozenset({
+    "anexo_id", "norma_id", "anexo_fiscal_id", "norma_legal_id",
+})
+
+def _sanitize_unresolved(row: dict, filename: str, table: str) -> dict:
+    """
+    Após resolver placeholders, verifica se algum campo FK uuid ainda
+    contém uma string <...> (resolver retornou None, mas o campo pode
+    ter vindo de outro caminho). Substitui por None e loga.
+    Também garante que None não vire a string 'None'.
+    """
+    result = {}
+    for k, v in row.items():
+        if _is_placeholder(v):
+            # Placeholder não foi resolvido — setar None explicitamente
+            log.warning(
+                f"[icms] {filename}/{table}: campo '{k}' ainda é placeholder "
+                f"após resolução: {v} — setado como None"
+            )
+            result[k] = None
+        elif k in _UUID_FK_FIELDS and isinstance(v, str) and not v.strip():
+            result[k] = None
+        else:
+            result[k] = v
+    return result
+
+
 def _upsert_row(
     table: str,
     row: dict,
@@ -844,12 +871,16 @@ def _upsert_row(
     filename: str,
 ) -> str | None:
     """
-    Resolve FKs → normaliza → valida colunas de conflito → upsert.
+    Resolve FKs → sanitiza placeholders residuais → normaliza → valida → upsert.
     Retorna o UUID gerado ou None em caso de falha.
     NUNCA levanta exceção — sempre loga e continua.
     """
     # Resolver placeholders de FK
     row = resolver.resolve_all(row)
+
+    # Sanitizar: campos UUID que ainda contêm placeholder (não resolvidos)
+    # → substituir por None para não enviar string inválida ao Supabase
+    row = _sanitize_unresolved(row, filename, table)
 
     # Normalizar campos
     row = _normalizar_registro(table, row, filename)
@@ -919,6 +950,7 @@ def _processar_bloco(data: dict, filename: str, resolver: _Resolver) -> dict:
             else:
                 # produtos_icms_st: INSERT puro (sem on_conflict) — UUID pelo Supabase
                 row_norm = resolver.resolve_all(dict(row))
+                row_norm = _sanitize_unresolved(row_norm, filename, table)
                 row_norm = _normalizar_registro(table, row_norm, filename)
                 try:
                     resp = supabase.table(table).insert(row_norm).execute()
