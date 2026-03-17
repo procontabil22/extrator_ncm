@@ -1,5 +1,5 @@
 """
-Microserviço de Extração Fiscal v2.7
+Microserviço de Extração Fiscal v2.8
 =====================================
 Três camadas: Determinístico → Regex → Semântico (LLM)
 Mapeado para a estrutura REAL das tabelas no Supabase.
@@ -18,6 +18,13 @@ v2.4 — Correções críticas:
 v2.5 — Correção de regex:
         • _PH_RE: aceita letras minúsculas e hífens —
           <NORMA_ID_conv_icms_51_2000> não era detectado pelo padrão anterior
+
+v2.8 — Resolver global entre arquivos para anexos_normas:
+        • _GlobalResolver: singleton que acumula placeholder→UUID ao longo
+          de todos os arquivos da pasta — normas inseridas em arquivo A
+          ficam disponíveis para arquivo B que as referencia em anexos_normas
+        • _run_upsert_icms_jsons: passa o mesmo resolver global para todos
+          os blocos, eliminando as 220 falhas de norma_id=None em anexos_normas
 
 v2.7 — NCM multi-valor explodido em linhas individuais:
         • produtos_icms_st: campo ncm pode conter múltiplos NCMs separados
@@ -83,7 +90,7 @@ try:
 except: HAS_GDRIVE = False
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Extrator Fiscal v2.7", version="2.7.0")
+app = FastAPI(title="Extrator Fiscal v2.8", version="2.8.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -586,7 +593,7 @@ def _svc():
 @app.get("/health")
 def health():
     return {
-        "status": "ok", "versao": "2.7.0",
+        "status": "ok", "versao": "2.8.0",
         "supabase": supabase is not None,
         "pdf": HAS_PDF, "xlsx": HAS_XLSX, "docx": HAS_DOCX, "gdrive": HAS_GDRIVE,
     }
@@ -657,7 +664,7 @@ async def _pasta(folder_id):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# UPSERT JSONs ICMS-ST  v2.7
+# UPSERT JSONs ICMS-ST  v2.8
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ── Ordem de inserção respeitando FKs ────────────────────────────────────────
@@ -778,8 +785,12 @@ class _Resolver:
     v2.4: register_failed() permite marcar um placeholder como "falhou" —
     resolve() retorna None para esses casos em vez de logar "não resolvido".
     """
-    def __init__(self, filename: str):
+    def __init__(self, filename: str = ""):
         self._map: dict[str, str] = {}
+        self._file = filename
+
+    def set_file(self, filename: str):
+        """Atualiza o arquivo atual para logs — mantém o mapa acumulado."""
         self._file = filename
 
     def register(self, placeholder: str, real_id: str):
@@ -934,7 +945,7 @@ _NOT_NULL_COLS: dict[str, list[str]] = {
 # com INSERT puro pois não têm constraint UNIQUE confirmada no schema.
 _UPSERT_CONFLICT: dict[str, str] = {
     "normas_legais":  "tipo_norma,numero,ano,orgao_emissor",
-    "produtos_icms_st": "cest,ncm",
+    "produtos_icms_st": "cest,ncm,anexo_fiscal_id",
 }
 
 
@@ -1151,6 +1162,9 @@ async def _run_upsert_icms_jsons(folder_id: str):
     total  = {t: 0 for t in _TABLE_ORDER}
     erros_geral: list[str] = []
 
+    # v2.8: resolver global — acumula placeholder→UUID entre todos os arquivos
+    resolver = _Resolver()
+
     for file_meta in files:
         file_id  = file_meta["id"]
         filename = file_meta["name"]
@@ -1168,8 +1182,10 @@ async def _run_upsert_icms_jsons(folder_id: str):
             erros_geral.append(f"download:{filename}")
             continue
 
-        resolver = _Resolver(filename)
-        blocos   = _normalizar_blocos(bloco_json)
+        # v2.8: resolver é global — reutilizado entre arquivos
+        # para que normas inseridas em arquivo A sejam acessíveis em arquivo B
+        resolver.set_file(filename)
+        blocos = _normalizar_blocos(bloco_json)
 
         if not blocos:
             log.warning(f"[icms] '{filename}': nenhum bloco reconhecível — ignorado")
