@@ -1,8 +1,17 @@
 """
-Microserviço de Extração Fiscal v3.0
+Microserviço de Extração Fiscal v3.1
 =====================================
 Três camadas: Determinístico → Regex → Semântico (LLM)
 Mapeado para a estrutura REAL das tabelas no Supabase.
+
+v3.1 — Correção aliq_pis_simples / aliq_cofins_simples:
+        • Colunas convertidas de GENERATED ALWAYS AS para numeric normal
+          via ALTER TABLE ... DROP EXPRESSION (migration aplicada em 17/03/2026)
+        • mk_mono e _mapear_item_monofasico agora inserem 0 (zero numérico)
+          em vez de None — conforme LC 126/2003: Simples Nacional tem alíquota
+          zero nos produtos monofásicos
+        • Removida a constante _GENERATED_COLS_MONO (não é mais necessária)
+        • _run_upsert_monofasicos usa registros diretamente no BATCH (sem filtro)
 
 v3.0 — Pipeline independente para produtos_monofasicos via JSON:
         • Novo endpoint POST /upsert-monofasicos
@@ -56,8 +65,6 @@ OPENAI_API_KEY          = os.getenv("OPENAI_API_KEY", "")
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
 DRIVE_FOLDER_ID         = os.getenv("DRIVE_FOLDER_ID", "")
 DRIVE_FOLDER_ID_JSONS   = os.getenv("DRIVE_FOLDER_ID_JSONS", "")
-# v3.0: pasta Drive dedicada aos JSONs de produtos monofásicos
-# Pode ser a mesma que DRIVE_FOLDER_ID_JSONS ou uma pasta separada
 DRIVE_FOLDER_ID_MONO    = os.getenv("DRIVE_FOLDER_ID_MONO", "")
 
 # ── Imports opcionais ─────────────────────────────────────────────────────────
@@ -81,7 +88,7 @@ try:
 except: HAS_GDRIVE = False
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Extrator Fiscal v3.0", version="3.0.0")
+app = FastAPI(title="Extrator Fiscal v3.1", version="3.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -231,8 +238,10 @@ def mk_mono(ncm, descricao, segmento, cst_pis, natureza, base_legal, lei,
         "aliq_cofins_presumido": 3.0,
         "aliq_pis_real":         1.65,
         "aliq_cofins_real":      7.6,
-        "aliq_pis_simples":      None,
-        "aliq_cofins_simples":   None,
+        # v3.1: colunas convertidas de GENERATED para numeric normal
+        # LC 126/2003 — Simples Nacional tem alíquota zero em monofásicos
+        "aliq_pis_simples":      0,
+        "aliq_cofins_simples":   0,
         "segmento":              segmento,
         "descricao_cst":         CST_DESC.get(cst),
         "fonte_arquivo":         fonte,
@@ -584,7 +593,7 @@ def _svc():
 @app.get("/health")
 def health():
     return {
-        "status": "ok", "versao": "3.0.0",
+        "status": "ok", "versao": "3.1.0",
         "supabase": supabase is not None,
         "pdf": HAS_PDF, "xlsx": HAS_XLSX, "docx": HAS_DOCX, "gdrive": HAS_GDRIVE,
     }
@@ -1080,10 +1089,9 @@ async def _run_upsert_icms_jsons(folder_id: str):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PIPELINE MONOFÁSICOS v3.0 — leitura de JSON estruturado do Drive
+# PIPELINE MONOFÁSICOS v3.1
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# ── Colunas aceitas pela tabela produtos_monofasicos ─────────────────────────
 _SCHEMA_MONO = {
     "ncm", "descricao", "base_legal", "lei", "vigencia_inicio", "vigencia_fim",
     "ativo", "norma_legal_id", "normas_relacionadas", "content", "metadata",
@@ -1093,8 +1101,6 @@ _SCHEMA_MONO = {
     "regime_tributario", "fonte_arquivo", "metodo_extracao", "updated_at",
 }
 
-# ── Mapa de segmento inferido a partir da descrição do grupo ─────────────────
-# Chave = fragmento do campo "group" no JSON (lowercase)
 _SEGMENTO_GRUPO: list[tuple[str, str]] = [
     ("combustív",          "Combustíveis"),
     ("derivados de petról","Combustíveis"),
@@ -1113,7 +1119,6 @@ _SEGMENTO_GRUPO: list[tuple[str, str]] = [
 
 
 def _segmento_por_grupo(group_label: str) -> str:
-    """Infere segmento a partir da descrição do grupo no JSON."""
     gl = group_label.lower()
     for fragmento, segmento in _SEGMENTO_GRUPO:
         if fragmento in gl:
@@ -1121,11 +1126,7 @@ def _segmento_por_grupo(group_label: str) -> str:
     return "Não identificado"
 
 
-def _parse_aliq(valor: str | None) -> float | None:
-    """
-    Converte string de alíquota para float.
-    Ex: "2,7%" → 2.7  |  "var." → None  |  "–" → None  |  "0,0%" → 0.0
-    """
+def _parse_aliq(valor) -> float | None:
     if not valor or str(valor).strip() in ("var.", "–", "-", ""):
         return None
     try:
@@ -1134,30 +1135,7 @@ def _parse_aliq(valor: str | None) -> float | None:
         return None
 
 
-def _mapear_item_monofasico(
-    item: dict,
-    group_label: str,
-    filename: str,
-) -> dict | None:
-    """
-    Converte um item do JSON de produtos monofásicos para o schema da tabela.
-
-    Estrutura esperada do item:
-      ncm              → ncm (limpar pontos)
-      description      → descricao
-      cst_mono_04      → cst_pis / cst_cofins
-      al_pis_maj_percent   → aliq_pis_presumido  (alíquota majorada = fabricante)
-      al_cof_maj_percent   → aliq_cofins_presumido
-      al_pis_norm_percent  → aliq_pis_real
-      al_cof_norm_percent  → aliq_cofins_real
-      cod_nat_rec      → natureza_receita
-      legal_basis      → base_legal + lei (extraída via regex)
-
-    Campos sem correspondência no JSON (ficam None / default):
-      vigencia_inicio, vigencia_fim, norma_legal_id, normas_relacionadas,
-      content, metadata, embedding, aliq_pis_simples, aliq_cofins_simples,
-      regime_tributario
-    """
+def _mapear_item_monofasico(item: dict, group_label: str, filename: str) -> dict | None:
     ncm_raw = str(item.get("ncm") or "").strip()
     ncm     = limpar_ncm(ncm_raw)
     if not ncm:
@@ -1168,15 +1146,12 @@ def _mapear_item_monofasico(
     cst_raw      = str(item.get("cst_mono_04") or "04").strip()
     legal_basis  = str(item.get("legal_basis") or "").strip() or None
     cod_nat      = str(item.get("cod_nat_rec") or "").strip() or None
-    group_num    = str(item.get("group_number") or "").strip() or None
 
-    # Alíquotas — "maj" = majorada (fabricante) → presumido; "norm" = normal → real
     aliq_pis_pres  = _parse_aliq(item.get("al_pis_maj_percent"))
     aliq_cof_pres  = _parse_aliq(item.get("al_cof_maj_percent"))
     aliq_pis_real  = _parse_aliq(item.get("al_pis_norm_percent"))
     aliq_cof_real  = _parse_aliq(item.get("al_cof_norm_percent"))
 
-    # Extrai lei do campo legal_basis (ex: "Lei 9.718/98; Decreto 8.395/2015")
     lei = None
     if legal_basis:
         lei_match = RE_LEI.search(legal_basis)
@@ -1196,12 +1171,13 @@ def _mapear_item_monofasico(
         "normas_relacionadas":   None,
         "content":               None,
         "metadata":              None,
-        # Campos PIS/COFINS
         "cst_pis":               cst_raw,
         "cst_cofins":            cst_raw,
         "natureza_receita":      cod_nat,
-        "aliq_pis_simples":      None,
-        "aliq_cofins_simples":   None,
+        # v3.1: inserido como 0 (LC 126/2003 — Simples Nacional alíquota zero)
+        # Colunas convertidas de GENERATED ALWAYS AS para numeric em 17/03/2026
+        "aliq_pis_simples":      0,
+        "aliq_cofins_simples":   0,
         "aliq_pis_presumido":    aliq_pis_pres,
         "aliq_cofins_presumido": aliq_cof_pres,
         "aliq_pis_real":         aliq_pis_real,
@@ -1216,28 +1192,12 @@ def _mapear_item_monofasico(
 
 
 def _extrair_registros_mono(data: dict, filename: str) -> list[dict]:
-    """
-    Lê a chave 'produtos_monofasicos' do JSON (lista de grupos com items)
-    e retorna lista de dicts prontos para upsert em produtos_monofasicos.
-
-    Estrutura esperada:
-    {
-      "produtos_monofasicos": [
-        {
-          "group": "GRUPO 100 – COMBUSTÍVEIS E DERIVADOS DE PETRÓLEO",
-          "items": [ { "ncm": "...", ... }, ... ]
-        },
-        ...
-      ]
-    }
-    """
     grupos = data.get("produtos_monofasicos")
     if not grupos or not isinstance(grupos, list):
         log.warning(f"[mono] '{filename}': chave 'produtos_monofasicos' ausente ou vazia")
         return []
 
     registros: list[dict] = []
-    total_itens = 0
     total_invalidos = 0
 
     for grupo in grupos:
@@ -1250,15 +1210,11 @@ def _extrair_registros_mono(data: dict, filename: str) -> list[dict]:
             log.warning(f"[mono] '{filename}' grupo '{group_label}': 'items' não é lista")
             continue
 
-        log.info(
-            f"[mono] '{filename}' grupo '{group_label}': "
-            f"{len(items)} item(ns)"
-        )
+        log.info(f"[mono] '{filename}' grupo '{group_label}': {len(items)} item(ns)")
 
         for item in items:
             if not isinstance(item, dict):
                 continue
-            total_itens += 1
             registro = _mapear_item_monofasico(item, group_label, filename)
             if registro:
                 registros.append(registro)
@@ -1274,12 +1230,10 @@ def _extrair_registros_mono(data: dict, filename: str) -> list[dict]:
 
 async def _run_upsert_monofasicos(folder_id: str):
     """
-    v3.0 — Pipeline independente para produtos_monofasicos.
+    v3.1 — Pipeline independente para produtos_monofasicos.
     Baixa todos os JSONs da pasta do Drive que contenham a chave
     'produtos_monofasicos' e faz upsert em produtos_monofasicos com
     on_conflict=ncm.
-
-    Não compartilha estado nem tabelas com o pipeline ICMS-ST.
     """
     svc = _svc()
     if not svc:
@@ -1315,7 +1269,6 @@ async def _run_upsert_monofasicos(folder_id: str):
         filename = file_meta["name"]
         log.info(f"[mono] baixando '{filename}'…")
 
-        # ── Download ──────────────────────────────────────────────────────────
         try:
             buf = io.BytesIO()
             dl  = MediaIoBaseDownload(buf, svc.files().get_media(fileId=file_id))
@@ -1328,18 +1281,16 @@ async def _run_upsert_monofasicos(folder_id: str):
             total_erros += 1
             continue
 
-        # ── Extrair e mapear registros ────────────────────────────────────────
         registros = _extrair_registros_mono(data_json, filename)
         if not registros:
             log.warning(f"[mono] '{filename}': nenhum registro extraído — ignorado")
             continue
 
-        # ── Deduplicação por NCM (mantém registro com mais campos preenchidos)
         registros = dedup(registros)
         log.info(f"[mono] '{filename}': {len(registros)} registro(s) após dedup")
 
-        # ── Upsert em lote com on_conflict=ncm ───────────────────────────────
-        # Insere em batches de 500 para evitar payload excessivo
+        # v3.1: aliq_pis_simples e aliq_cofins_simples agora são colunas normais
+        # (DROP EXPRESSION aplicado em 17/03/2026) — enviadas diretamente como 0
         BATCH = 500
         for i in range(0, len(registros), BATCH):
             lote = registros[i:i + BATCH]
@@ -1370,7 +1321,7 @@ async def _run_upsert_monofasicos(folder_id: str):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ENDPOINTS — ICMS-ST (inalterados)
+# ENDPOINTS — ICMS-ST
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/upsert-icms-st")
@@ -1378,10 +1329,6 @@ async def upsert_icms_st(
     background_tasks: BackgroundTasks,
     folder_id: Optional[str] = None,
 ):
-    """
-    Lê os JSONs dos Anexos RICMS/MA de uma pasta do Google Drive
-    e faz upsert nas 7 tabelas do Supabase na ordem correta.
-    """
     if not supabase:
         raise HTTPException(503, "Supabase não configurado")
     if not HAS_GDRIVE:
@@ -1405,7 +1352,6 @@ async def upsert_icms_st(
 
 @app.get("/status-icms-st")
 def status_icms_st():
-    """Contagem de registros nas 7 tabelas do pipeline ICMS-ST."""
     if not supabase:
         return {"erro": "Supabase não configurado"}
     resultado = {}
@@ -1420,7 +1366,7 @@ def status_icms_st():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ENDPOINTS — MONOFÁSICOS v3.0
+# ENDPOINTS — MONOFÁSICOS v3.1
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/upsert-monofasicos")
@@ -1429,14 +1375,10 @@ async def upsert_monofasicos(
     folder_id: Optional[str] = None,
 ):
     """
-    v3.0 — Lê JSONs com a chave 'produtos_monofasicos' de uma pasta do
+    v3.1 — Lê JSONs com a chave 'produtos_monofasicos' de uma pasta do
     Google Drive e faz upsert em produtos_monofasicos (on_conflict=ncm).
-
-    Rotina completamente independente do pipeline ICMS-ST.
-
-    Query params:
-      folder_id  — ID da pasta no Drive (opcional se DRIVE_FOLDER_ID_MONO
-                   estiver definido no ambiente)
+    aliq_pis_simples e aliq_cofins_simples agora são inseridas como 0
+    (LC 126/2003 — Simples Nacional alíquota zero).
     """
     if not supabase:
         raise HTTPException(503, "Supabase não configurado")
@@ -1461,13 +1403,9 @@ async def upsert_monofasicos(
 
 @app.get("/status-monofasicos")
 def status_monofasicos():
-    """
-    v3.0 — Resumo dos registros em produtos_monofasicos agrupados por segmento.
-    """
     if not supabase:
         return {"erro": "Supabase não configurado"}
     try:
-        # Contagem total
         total_resp = (
             supabase.table("produtos_monofasicos")
             .select("id", count="exact")
@@ -1475,7 +1413,6 @@ def status_monofasicos():
         )
         total = total_resp.count
 
-        # Contagem de ativos
         ativos_resp = (
             supabase.table("produtos_monofasicos")
             .select("id", count="exact")
@@ -1484,7 +1421,6 @@ def status_monofasicos():
         )
         ativos = ativos_resp.count
 
-        # Amostra dos 5 registros mais recentes
         recentes_resp = (
             supabase.table("produtos_monofasicos")
             .select("ncm, descricao, segmento, cst_pis, fonte_arquivo, updated_at")
