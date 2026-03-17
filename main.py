@@ -931,25 +931,37 @@ def _upsert_row(
         return None
 
 
-# ── Chaves de conflito por tabela ────────────────────────────────────────────
-# Usamos apenas colunas que identificam univocamente o registro para o ON CONFLICT.
-# Para produtos_icms_st a PK é UUID — não há constraint de unicidade em (cest,ncm).
-# Por isso usamos apenas 'ncm,cest,anexo_fiscal_id' como melhor aproximação,
-# mas só quando todos os três estiverem presentes; caso contrário INSERT puro.
-_CONFLICT_COLS: dict[str, list[str]] = {
-    "normas_legais":              ["tipo_norma", "numero", "orgao_emissor"],
-    "anexos_fiscais":             ["sigla_anexo", "estado"],
-    "anexos_artigos":             ["anexo_id", "numero"],
+# ── Tabelas que usam INSERT puro (sem ON CONFLICT) ───────────────────────────
+# Motivo: não há constraint UNIQUE nas colunas naturais dessas tabelas.
+# O Supabase gera o UUID (id) e o retorna para o resolver registrar.
+# Todas as tabelas usam INSERT puro — nenhuma tem constraint UNIQUE confirmada.
+_INSERT_ONLY_TABLES = frozenset({
+    "normas_legais",
+    "anexos_fiscais",
+    "anexos_artigos",
+    "anexos_pontos_atencao",
+    "anexos_comparativo_redacao",
+    "anexos_normas",
+    "produtos_icms_st",
+})
+
+# ── Colunas NOT NULL que precisam ter valor antes do INSERT ──────────────────
+# Se estiverem None após normalização, o registro é descartado com log.
+_NOT_NULL_COLS: dict[str, list[str]] = {
+    "normas_legais":   ["tipo_norma", "numero", "ano"],
+    "anexos_fiscais":  ["estado", "nome_completo"],
+    "anexos_artigos":  ["anexo_id", "numero"],
     "anexos_pontos_atencao":      ["anexo_id", "descricao"],
-    "anexos_comparativo_redacao": ["anexo_id", "artigo", "dispositivo"],
+    "anexos_comparativo_redacao": ["anexo_id", "artigo"],
     "anexos_normas":              ["anexo_id", "norma_id"],
-    "produtos_icms_st":           [],   # INSERT puro — UUID gerado pelo Supabase
+    "produtos_icms_st":           ["segmento", "ncm", "cest", "descricao", "ativo"],
 }
 
 
 def _processar_bloco(data: dict, filename: str, resolver: _Resolver) -> dict:
     """
-    Itera as 7 tabelas de um bloco JSON e faz upsert em ordem.
+    Itera as 7 tabelas de um bloco JSON e faz INSERT em ordem.
+    Usa INSERT puro em todas as tabelas — o UUID é gerado pelo Supabase.
     Retorna contadores e lista de erros para log.
     """
     contadores = {t: 0 for t in _TABLE_ORDER}
@@ -960,38 +972,54 @@ def _processar_bloco(data: dict, filename: str, resolver: _Resolver) -> dict:
         if not rows:
             continue
 
-        conflict_cols = _CONFLICT_COLS[table]
         log.info(f"[icms] {filename}/{table}: {len(rows)} registro(s)")
 
         for row in rows:
-            placeholder = row.get("_id_referencia")  # antes da normalização
+            placeholder = row.get("_id_referencia")  # capturar antes da normalização
 
-            if conflict_cols:
-                real_id = _upsert_row(table, dict(row), conflict_cols, resolver, filename)
-            else:
-                # produtos_icms_st: INSERT puro (sem on_conflict) — UUID pelo Supabase
-                row_norm = resolver.resolve_all(dict(row))
-                row_norm = _sanitize_unresolved(row_norm, filename, table)
-                row_norm = _normalizar_registro(table, row_norm, filename)
-                try:
-                    resp = supabase.table(table).insert(row_norm).execute()
-                    data_resp = resp.data
-                    real_id = data_resp[0].get("id") if data_resp else None
-                except Exception as e:
-                    log.error(f"[icms] {filename}/{table}: insert erro — {e}")
-                    real_id = None
+            # 1. Resolver placeholders de FK
+            row_norm = resolver.resolve_all(dict(row))
+
+            # 2. Sanitizar placeholders residuais (FKs não resolvidas → None)
+            row_norm = _sanitize_unresolved(row_norm, filename, table)
+
+            # 3. Normalizar campos (aliases, schema, defaults)
+            row_norm = _normalizar_registro(table, row_norm, filename)
+
+            # 4. Validar campos NOT NULL
+            skip = False
+            for col in _NOT_NULL_COLS.get(table, []):
+                if row_norm.get(col) is None:
+                    log.warning(
+                        f"[icms] {filename}/{table}: campo NOT NULL '{col}' é None "
+                        f"— registro ignorado: {list(row_norm.items())[:3]}"
+                    )
+                    skip = True
+                    break
+            if skip:
+                ref = placeholder or str(list(row_norm.items())[:2])
+                erros.append(f"{table}:{ref}:null_not_null")
+                continue
+
+            # 5. INSERT puro — UUID gerado pelo Supabase
+            real_id = None
+            try:
+                resp = supabase.table(table).insert(row_norm).execute()
+                data_resp = resp.data
+                real_id = data_resp[0].get("id") if data_resp else None
+            except Exception as e:
+                log.error(f"[icms] {filename}/{table}: insert erro — {e} | dados: {list(row_norm.items())[:4]}")
 
             if real_id:
-                # Registrar no resolver para que FKs subsequentes sejam resolvidas
                 if placeholder:
                     resolver.register(placeholder, real_id)
                 contadores[table] += 1
             else:
                 ref = (
                     placeholder
-                    or row.get("ncm")
-                    or row.get("sigla_anexo")
-                    or row.get("descricao", "")[:40]
+                    or row_norm.get("ncm")
+                    or row_norm.get("sigla_anexo")
+                    or str(row_norm.get("descricao", ""))[:40]
                     or "?"
                 )
                 erros.append(f"{table}:{ref}")
