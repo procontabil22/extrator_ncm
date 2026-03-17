@@ -1,5 +1,5 @@
 """
-Microserviço de Extração Fiscal v2.5
+Microserviço de Extração Fiscal v2.6
 =====================================
 Três camadas: Determinístico → Regex → Semântico (LLM)
 Mapeado para a estrutura REAL das tabelas no Supabase.
@@ -13,14 +13,19 @@ v2.4 — Correções críticas:
           (evita cascata de erros 22P02 por placeholder não-resolvido)
         • _normalizar_registro: aliases aplicados ANTES do filtro de schema,
           evitando que campos com alias caiam no filtro e sejam descartados
-        • _upsert_row removida (era código morto — _processar_bloco faz insert
-          diretamente; manter as duas lógicas causava confusão)
-        • _sanitize_unresolved: agora recebe o resolver e loga o placeholder
-          original para facilitar diagnóstico
-        • _PH_RE: regex corrigido para aceitar letras minúsculas e hífens —
-          placeholders como <NORMA_ID_conv_icms_51_2000> não eram detectados
-          pelo padrão anterior [A-Z0-9_]+ e chegavam intactos ao Supabase,
-          causando erro 22P02 mesmo após o resolve_all() e _sanitize_unresolved()
+        • _upsert_row removida (era código morto)
+
+v2.5 — Correção de regex:
+        • _PH_RE: aceita letras minúsculas e hífens —
+          <NORMA_ID_conv_icms_51_2000> não era detectado pelo padrão anterior
+
+v2.6 — Idempotência e RLS em produtos_icms_st:
+        • normas_legais: INSERT → UPSERT on_conflict=tipo_norma,numero,ano,
+          orgao_emissor — reexecuções recuperam o UUID existente em vez de
+          falhar com 23505; resolver registra corretamente para dependentes
+        • produtos_icms_st: mesmo padrão — upsert on_conflict=cest,ncm com
+          fallback de SELECT para recuperar UUID quando resp.data vier vazio
+        • _UPSERT_CONFLICT: mapa tabela → colunas de conflito para upsert
 """
 
 import os, re, io, json, base64, logging
@@ -71,7 +76,7 @@ try:
 except: HAS_GDRIVE = False
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Extrator Fiscal v2.5", version="2.5.0")
+app = FastAPI(title="Extrator Fiscal v2.6", version="2.6.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -574,7 +579,7 @@ def _svc():
 @app.get("/health")
 def health():
     return {
-        "status": "ok", "versao": "2.5.0",
+        "status": "ok", "versao": "2.6.0",
         "supabase": supabase is not None,
         "pdf": HAS_PDF, "xlsx": HAS_XLSX, "docx": HAS_DOCX, "gdrive": HAS_GDRIVE,
     }
@@ -645,7 +650,7 @@ async def _pasta(folder_id):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# UPSERT JSONs ICMS-ST  v2.5
+# UPSERT JSONs ICMS-ST  v2.6
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ── Ordem de inserção respeitando FKs ────────────────────────────────────────
@@ -915,6 +920,16 @@ _NOT_NULL_COLS: dict[str, list[str]] = {
     "produtos_icms_st":           ["segmento", "ncm", "cest", "descricao", "ativo"],
 }
 
+# ── Tabelas que usam UPSERT (idempotente) em vez de INSERT puro ───────────────
+# v2.6: normas_legais e produtos_icms_st usam upsert para que reexecuções
+# do pipeline não falhem com 23505 e possam recuperar UUIDs existentes.
+# Demais tabelas (artigos, pontos_atencao, normas, comparativo) continuam
+# com INSERT puro pois não têm constraint UNIQUE confirmada no schema.
+_UPSERT_CONFLICT: dict[str, str] = {
+    "normas_legais":  "tipo_norma,numero,ano,orgao_emissor",
+    "produtos_icms_st": "cest,ncm",
+}
+
 
 def _processar_bloco(bloco_data: dict, filename: str, resolver: _Resolver) -> dict:
     """
@@ -968,15 +983,45 @@ def _processar_bloco(bloco_data: dict, filename: str, resolver: _Resolver) -> di
                 erros.append(f"{table}:{ref}:null_not_null")
                 continue
 
-            # 5. INSERT — UUID gerado pelo Supabase
-            # Nota: usamos 'resp_data' (não 'data') para não ofuscar 'bloco_data'
+            # 5. INSERT ou UPSERT — UUID gerado/recuperado pelo Supabase
+            # v2.6: tabelas em _UPSERT_CONFLICT usam upsert para idempotência.
+            # Quando resp.data vier vazio (RLS bloqueia o SELECT de retorno mas
+            # permite o write), faz um SELECT explícito para recuperar o UUID.
             real_id = None
             insert_ok = False
+            conflict_cols = _UPSERT_CONFLICT.get(table)
             try:
-                resp = supabase.table(table).insert(row_norm).execute()
+                if conflict_cols:
+                    resp = (
+                        supabase.table(table)
+                        .upsert(row_norm, on_conflict=conflict_cols)
+                        .execute()
+                    )
+                else:
+                    resp = supabase.table(table).insert(row_norm).execute()
+
                 resp_data = resp.data
                 real_id = resp_data[0].get("id") if resp_data else None
+
+                # Fallback: RLS pode bloquear o SELECT de retorno mesmo após
+                # write bem-sucedido — buscar UUID explicitamente pelo conflito
+                if real_id is None and conflict_cols:
+                    filter_cols = conflict_cols.split(",")
+                    q = supabase.table(table).select("id")
+                    for col in filter_cols:
+                        val = row_norm.get(col)
+                        if val is not None:
+                            q = q.eq(col, val)
+                    fallback = q.limit(1).execute()
+                    if fallback.data:
+                        real_id = fallback.data[0].get("id")
+                        log.info(
+                            f"[icms] {filename}/{table}: UUID recuperado via "
+                            f"SELECT fallback — {real_id[:8]}…"
+                        )
+
                 insert_ok = real_id is not None
+
             except Exception as e:
                 log.error(
                     f"[icms] {filename}/{table}: insert erro — {e} "
@@ -988,7 +1033,7 @@ def _processar_bloco(bloco_data: dict, filename: str, resolver: _Resolver) -> di
                     resolver.register(placeholder, real_id)
                 contadores[table] += 1
             else:
-                # Insert falhou — marcar placeholder como FAILED para cortar
+                # Falhou — marcar placeholder como FAILED para cortar
                 # a cascata de erros 22P02 nos registros que dependem desta FK
                 if placeholder:
                     resolver.register_failed(placeholder)
