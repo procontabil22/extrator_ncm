@@ -1,8 +1,24 @@
 """
-Microserviço de Extração Fiscal v3.1
+Microserviço de Extração Fiscal v3.2
 =====================================
 Três camadas: Determinístico → Regex → Semântico (LLM)
 Mapeado para a estrutura REAL das tabelas no Supabase.
+
+v3.3 — Correcao vigencia_inicio NOT NULL / aliq_cofins_presumido:
+        • Ambas as colunas confirmadas como NEVER GENERATED via
+          information_schema (verificado em 17/03/2026)
+        • _GENERATED_COLS_MONO introduzida como guarda de segurança:
+          lista explícita de colunas a NUNCA enviar no payload — se o
+          banco reverter para GENERATED por qualquer motivo, o código
+          não quebra
+        • _filtrar_payload_mono(): remove automaticamente qualquer coluna
+          da lista _GENERATED_COLS_MONO antes do upsert
+        • mk_mono e _mapear_item_monofasico mantêm aliq_pis_presumido e
+          aliq_cofins_presumido nos dicts — _filtrar_payload_mono decide
+          em runtime se envia ou não com base em _GENERATED_COLS_MONO
+        • _GENERATED_COLS_MONO vazia por padrão (colunas são normais):
+          esvaziar = enviar tudo; popular = bloquear colunas GENERATED
+        • Cabeçalho do arquivo atualizado com estado atual das colunas
 
 v3.1 — Correção aliq_pis_simples / aliq_cofins_simples:
         • Colunas convertidas de GENERATED ALWAYS AS para numeric normal
@@ -38,6 +54,14 @@ v2.7 — NCM multi-valor explodido em linhas individuais
 v2.6 — Idempotência e RLS em produtos_icms_st
 v2.5 — Correção de regex _PH_RE (minúsculas e hífens)
 v2.4 — Correções críticas de RLS, colisão de variável, aliases e normas_legais
+
+──────────────────────────────────────────────────────────────────────────────
+Estado atual das colunas de produtos_monofasicos (17/03/2026):
+  GENERATED (nunca enviar):  — nenhuma —
+  NORMAL    (enviar sempre):  aliq_pis_simples, aliq_cofins_simples,
+                               aliq_pis_presumido, aliq_cofins_presumido,
+                               aliq_pis_real, aliq_cofins_real
+──────────────────────────────────────────────────────────────────────────────
 """
 
 import os, re, io, json, base64, logging
@@ -88,7 +112,7 @@ try:
 except: HAS_GDRIVE = False
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Extrator Fiscal v3.1", version="3.1.0")
+app = FastAPI(title="Extrator Fiscal v3.3", version="3.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -172,6 +196,47 @@ SEGMENTOS = {
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# v3.2 — GUARDA DE SEGURANÇA: colunas GENERATED em produtos_monofasicos
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Liste aqui APENAS as colunas que ainda são GENERATED ALWAYS AS no banco.
+# Quando vazia (padrão), todos os campos são enviados normalmente no payload.
+# Se o banco reverter alguma coluna para GENERATED, adicione-a aqui —
+# _filtrar_payload_mono() a removerá automaticamente antes de cada upsert.
+#
+# Estado em 17/03/2026: TODAS as colunas de alíquota são NORMAL (NEVER).
+# Verificado via: SELECT column_name, is_generated FROM information_schema.columns
+#                 WHERE table_name = 'produtos_monofasicos'
+#
+_GENERATED_COLS_MONO: frozenset[str] = frozenset({
+    # Exemplos (descomente se o banco reverter):
+    # "aliq_pis_presumido",
+    # "aliq_cofins_presumido",
+    # "aliq_pis_simples",
+    # "aliq_cofins_simples",
+})
+
+
+def _filtrar_payload_mono(registro: dict) -> dict:
+    """
+    Remove do payload qualquer coluna listada em _GENERATED_COLS_MONO.
+    Loga um aviso por coluna removida para rastreabilidade.
+    """
+    if not _GENERATED_COLS_MONO:
+        return registro
+    filtrado = {}
+    for k, v in registro.items():
+        if k in _GENERATED_COLS_MONO:
+            log.warning(
+                f"[mono] coluna '{k}' removida do payload "
+                f"(listada em _GENERATED_COLS_MONO como GENERATED)"
+            )
+        else:
+            filtrado[k] = v
+    return filtrado
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # HELPERS — EXTRAÇÃO NCM
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -223,12 +288,15 @@ def now():
 def mk_mono(ncm, descricao, segmento, cst_pis, natureza, base_legal, lei,
             vigencia_inicio, vigencia_fim, fonte, metodo):
     cst = cst_pis or "04"
+    # v3.2: vigencia_inicio e NOT NULL no banco -- fallback 1998-01-01
+    # (marco inicial do regime monofasico PIS/Cofins -- Lei 9.718/98)
+    vig_ini = vigencia_inicio or "1998-01-01"
     return {
         "ncm":                   ncm,
         "descricao":             descricao,
         "base_legal":            base_legal,
         "lei":                   lei,
-        "vigencia_inicio":       vigencia_inicio,
+        "vigencia_inicio":       vig_ini,
         "vigencia_fim":          vigencia_fim,
         "ativo":                 vigencia_fim is None,
         "cst_pis":               cst,
@@ -472,7 +540,11 @@ def salvar(mono, st):
     if not supabase: return {"mono": 0, "st": 0, "erros": ["Supabase não configurado"]}
     r = {"mono": 0, "st": 0, "erros": []}
     if mono:
-        try: supabase.table("produtos_monofasicos").upsert(mono, on_conflict="ncm").execute(); r["mono"] = len(mono)
+        # v3.2: aplica filtro de colunas GENERATED antes de salvar
+        mono_filtrado = [_filtrar_payload_mono(m) for m in mono]
+        try:
+            supabase.table("produtos_monofasicos").upsert(mono_filtrado, on_conflict="ncm").execute()
+            r["mono"] = len(mono_filtrado)
         except Exception as e: r["erros"].append(f"mono:{str(e)[:200]}"); log.error(e)
     if st:
         try: supabase.table("produtos_icms_st").upsert(st, on_conflict="ncm").execute(); r["st"] = len(st)
@@ -593,9 +665,10 @@ def _svc():
 @app.get("/health")
 def health():
     return {
-        "status": "ok", "versao": "3.1.0",
+        "status": "ok", "versao": "3.3.0",
         "supabase": supabase is not None,
         "pdf": HAS_PDF, "xlsx": HAS_XLSX, "docx": HAS_DOCX, "gdrive": HAS_GDRIVE,
+        "generated_cols_mono": sorted(_GENERATED_COLS_MONO),  # visibilidade em runtime
     }
 
 @app.get("/status")
@@ -1089,7 +1162,7 @@ async def _run_upsert_icms_jsons(folder_id: str):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PIPELINE MONOFÁSICOS v3.1
+# PIPELINE MONOFÁSICOS v3.2
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _SCHEMA_MONO = {
@@ -1159,14 +1232,18 @@ def _mapear_item_monofasico(item: dict, group_label: str, filename: str) -> dict
 
     segmento = _segmento_por_grupo(group_label)
 
+    # v3.2: vigencia_inicio é NOT NULL no banco — usa data da lei como fallback,
+    # depois a data de hoje; vigencia_fim permanece None (produto ainda ativo)
+    vig_inicio = nd(str(item.get("vigencia_inicio") or "").strip()) or "1998-01-01"
+
     return {
         "ncm":                   ncm,
         "descricao":             descricao,
         "base_legal":            legal_basis,
         "lei":                   lei,
-        "vigencia_inicio":       None,
-        "vigencia_fim":          None,
-        "ativo":                 True,
+        "vigencia_inicio":       vig_inicio,
+        "vigencia_fim":          nd(str(item.get("vigencia_fim") or "").strip()),
+        "ativo":                 nd(str(item.get("vigencia_fim") or "").strip()) is None,
         "norma_legal_id":        None,
         "normas_relacionadas":   None,
         "content":               None,
@@ -1175,9 +1252,11 @@ def _mapear_item_monofasico(item: dict, group_label: str, filename: str) -> dict
         "cst_cofins":            cst_raw,
         "natureza_receita":      cod_nat,
         # v3.1: inserido como 0 (LC 126/2003 — Simples Nacional alíquota zero)
-        # Colunas convertidas de GENERATED ALWAYS AS para numeric em 17/03/2026
+        # v3.2: também protegido por _filtrar_payload_mono se necessário
         "aliq_pis_simples":      0,
         "aliq_cofins_simples":   0,
+        # v3.2: colunas confirmadas como NEVER GENERATED (17/03/2026)
+        # valores vindos diretamente do JSON fonte
         "aliq_pis_presumido":    aliq_pis_pres,
         "aliq_cofins_presumido": aliq_cof_pres,
         "aliq_pis_real":         aliq_pis_real,
@@ -1230,10 +1309,13 @@ def _extrair_registros_mono(data: dict, filename: str) -> list[dict]:
 
 async def _run_upsert_monofasicos(folder_id: str):
     """
-    v3.1 — Pipeline independente para produtos_monofasicos.
+    v3.2 — Pipeline independente para produtos_monofasicos.
     Baixa todos os JSONs da pasta do Drive que contenham a chave
     'produtos_monofasicos' e faz upsert em produtos_monofasicos com
     on_conflict=ncm.
+    Aplica _filtrar_payload_mono() em cada lote antes do upsert para
+    garantir que colunas GENERATED nunca sejam enviadas, mesmo após
+    futuras alterações no banco.
     """
     svc = _svc()
     if not svc:
@@ -1289,8 +1371,9 @@ async def _run_upsert_monofasicos(folder_id: str):
         registros = dedup(registros)
         log.info(f"[mono] '{filename}': {len(registros)} registro(s) após dedup")
 
-        # v3.1: aliq_pis_simples e aliq_cofins_simples agora são colunas normais
-        # (DROP EXPRESSION aplicado em 17/03/2026) — enviadas diretamente como 0
+        # v3.2: filtra colunas GENERATED antes de cada lote
+        registros = [_filtrar_payload_mono(r) for r in registros]
+
         BATCH = 500
         for i in range(0, len(registros), BATCH):
             lote = registros[i:i + BATCH]
@@ -1366,7 +1449,7 @@ def status_icms_st():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ENDPOINTS — MONOFÁSICOS v3.1
+# ENDPOINTS — MONOFÁSICOS v3.2
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/upsert-monofasicos")
@@ -1375,10 +1458,9 @@ async def upsert_monofasicos(
     folder_id: Optional[str] = None,
 ):
     """
-    v3.1 — Lê JSONs com a chave 'produtos_monofasicos' de uma pasta do
+    v3.2 — Lê JSONs com a chave 'produtos_monofasicos' de uma pasta do
     Google Drive e faz upsert em produtos_monofasicos (on_conflict=ncm).
-    aliq_pis_simples e aliq_cofins_simples agora são inseridas como 0
-    (LC 126/2003 — Simples Nacional alíquota zero).
+    _filtrar_payload_mono() remove colunas GENERATED antes de cada upsert.
     """
     if not supabase:
         raise HTTPException(503, "Supabase não configurado")
