@@ -644,11 +644,15 @@ _TABLE_ORDER = [
 ]
 
 # ── Colunas aceitas por tabela (schema real do Supabase) ─────────────────────
+# ── Schema REAL do Supabase (verificado via information_schema) ───────────────
+# Apenas colunas que existem na tabela — nunca enviar campo fora desta lista.
 _SCHEMA_COLS: dict[str, set] = {
+    # normas_legais — campo principal é tipo_norma (não 'tipo')
     "normas_legais": {
-        "tipo", "numero", "ano", "orgao_emissor",
-        "data_publicacao", "data_vigencia_inicio", "data_vigencia_fim",
-        "ementa", "dispositivos_afetados", "ato",
+        "tipo_norma", "numero", "ano", "ementa", "data_publicacao",
+        "orgao_emissor", "esfera", "texto_completo", "url_fonte", "tags",
+        "uf", "artigo", "status", "data_vigencia", "data_revogacao",
+        "revogado_por", "versao_atual", "ultima_atualizacao",
     },
     "anexos_fiscais": {
         "estado", "orgao", "nome_completo", "sigla_anexo", "regulamento",
@@ -671,34 +675,43 @@ _SCHEMA_COLS: dict[str, set] = {
         "cst", "cfop_interestadual", "vigencia_inicio", "vigencia_fim", "ativo",
         "norma_legal_id", "descricao_cst", "fonte_arquivo", "metodo_extracao",
         "anexo_fiscal_id",
-        # user_id é opcional — preenchido pela aplicação, nunca pelos JSONs
+        # user_id omitido — preenchido pela aplicação, nunca pelos JSONs
     },
 }
 
 # ── Aliases: campo_no_json → campo_no_schema ─────────────────────────────────
-# Quando o JSON usa um nome diferente do schema, renomear silenciosamente.
-# Se o mesmo registro tiver AMBOS (original + alias), manter o do schema e
-# logar o conflito — nunca abortar.
+# Renomeia silenciosamente. Se ambos (original + destino) existirem no registro,
+# mantém o do schema e loga o conflito — nunca aborta.
 _FIELD_ALIASES: dict[str, dict[str, str]] = {
     "normas_legais": {
-        "orgao":        "orgao_emissor",   # lotes 4-5: alguns JSONs usam 'orgao'
-        "texto_ementa": "ementa",          # lotes 4-5: alguns JSONs usam 'texto_ementa'
-        "descricao":    "ementa",          # lotes 4-5: alguns JSONs usam 'descricao' no lugar de ementa
+        # nome do campo
+        "tipo":               "tipo_norma",       # JSONs usam 'tipo', tabela usa 'tipo_norma'
+        "orgao":              "orgao_emissor",     # alguns JSONs usam 'orgao'
+        "texto_ementa":       "ementa",            # alguns JSONs usam 'texto_ementa'
+        "descricao":          "ementa",            # alguns JSONs usam 'descricao'
+        # datas
+        "data_vigencia_inicio": "data_vigencia",   # tabela usa 'data_vigencia'
+        "data_vigencia_fim":    "data_revogacao",  # tabela usa 'data_revogacao'
+        # status
+        "situacao":           "status",            # JSONs usam 'situacao', tabela tem 'status'
+        "revogada":           "status",            # bool → converter abaixo via _pre_process
     },
-    # anexos_fiscais não precisa — 'orgao' já é o nome correto na tabela
+    # anexos_fiscais — 'orgao' já é o nome correto na tabela
 }
 
-# ── Campos a ignorar completamente (fora do schema, sem alias útil) ──────────
+# ── Campos a ignorar completamente (fora do schema e sem alias útil) ─────────
 _IGNORE_FIELDS = frozenset({
-    # Campos de controle/metadados dos JSONs
-    "situacao", "status", "esfera", "revogada",
-    # Campos extras identificados na auditoria
-    "dispositivos_impactados", "ncm_produto",
+    # Campos dos JSONs que não existem em nenhuma tabela
+    "ato", "dispositivos_afetados", "dispositivos_impactados", "ncm_produto",
+    "ambito",   # existia no schema antigo, não existe no Supabase real
 })
 
-# ── Defaults quando o campo obrigatório estiver ausente/nulo ─────────────────
+# ── Defaults para campos NOT NULL ausentes/nulos ─────────────────────────────
 _DEFAULTS: dict[str, dict] = {
     "normas_legais": {
+        "tipo_norma": "Norma",   # fallback genérico se tipo não vier
+        "numero":     "0",
+        "ano":        0,
     },
     "anexos_fiscais": {
         "estado":      "MA",
@@ -706,6 +719,10 @@ _DEFAULTS: dict[str, dict] = {
         "regulamento": "RICMS/MA — Decreto nº 19.714/2003",
     },
     "produtos_icms_st": {
+        "segmento":           "Não classificado",
+        "cest":               "00.000.00",   # NOT NULL — placeholder quando ausente
+        "ncm":                "0000",        # NOT NULL — placeholder quando ausente
+        "descricao":          "Sem descrição",
         "cst_icms":           "60",
         "csosn":              "500",
         "cfop_interno":       "5405",
@@ -782,6 +799,10 @@ def _normalizar_registro(table: str, raw: dict, filename: str) -> dict:
         target_key = aliases.get(key, key)
 
         if target_key != key:
+            # Conversão especial: revogada (bool) → status (string)
+            if key == "revogada" and target_key == "status":
+                val = "REVOGADO" if val else "ATIVO"
+
             # É um alias — verificar se o campo destino já foi preenchido pelo
             # próprio registro (conflito: dois campos com o mesmo propósito)
             if target_key in result:
@@ -916,7 +937,7 @@ def _upsert_row(
 # Por isso usamos apenas 'ncm,cest,anexo_fiscal_id' como melhor aproximação,
 # mas só quando todos os três estiverem presentes; caso contrário INSERT puro.
 _CONFLICT_COLS: dict[str, list[str]] = {
-    "normas_legais":              ["tipo", "numero", "orgao_emissor"],
+    "normas_legais":              ["tipo_norma", "numero", "orgao_emissor"],
     "anexos_fiscais":             ["sigla_anexo", "estado"],
     "anexos_artigos":             ["anexo_id", "numero"],
     "anexos_pontos_atencao":      ["anexo_id", "descricao"],
