@@ -1,51 +1,34 @@
 """
-Microserviço de Extração Fiscal v2.9
+Microserviço de Extração Fiscal v3.0
 =====================================
 Três camadas: Determinístico → Regex → Semântico (LLM)
 Mapeado para a estrutura REAL das tabelas no Supabase.
 
-v2.4 — Correções críticas:
-        • SUPABASE_KEY lê SUPABASE_SERVICE_ROLE_KEY (fix RLS 42501)
-        • _processar_bloco: variável 'data' renomeada para 'bloco_data' —
-          eliminada colisão com parâmetro homônimo que corrompia o loop
-        • normas_legais: falha de insert agora loga o erro completo E
-          registra placeholder com sentinela para abortar dependentes
-          (evita cascata de erros 22P02 por placeholder não-resolvido)
-        • _normalizar_registro: aliases aplicados ANTES do filtro de schema,
-          evitando que campos com alias caiam no filtro e sejam descartados
-        • _upsert_row removida (era código morto)
-
-v2.5 — Correção de regex:
-        • _PH_RE: aceita letras minúsculas e hífens —
-          <NORMA_ID_conv_icms_51_2000> não era detectado pelo padrão anterior
+v3.0 — Pipeline independente para produtos_monofasicos via JSON:
+        • Novo endpoint POST /upsert-monofasicos
+        • Novo endpoint GET  /status-monofasicos
+        • _run_upsert_monofasicos(): lê JSONs da pasta Drive com a chave
+          "produtos_monofasicos" (lista de grupos com "group" + "items")
+          e faz upsert em produtos_monofasicos com on_conflict=ncm
+        • _mapear_item_monofasico(): converte cada item do JSON para o
+          schema real da tabela (todas as colunas mapeadas explicitamente)
+        • _parse_aliq(): converte "2,7%" → 2.7 (float) e "var." → None
+        • _segmento_por_grupo(): infere segmento a partir da descrição do grupo
+        • Rotina completamente independente do pipeline ICMS-ST — não
+          compartilha estado, resolver nem tabelas
 
 v2.9 — descricao_cst nula para cst_icms="60":
         • CST_DESC: adicionado alias "60" → "ICMS-ST cobrado anteriormente"
-          (JSONs gravam "60" sem zero à esquerda, mas o dict só tinha "060")
-        • mk_st: descricao_cst agora usa o cst real do registro em vez de
-          "060" fixo, com fallback para "060" se não encontrar
+        • mk_st: descricao_cst usa o cst real do registro com fallback "060"
 
 v2.8 — Resolver global entre arquivos para anexos_normas:
         • _GlobalResolver: singleton que acumula placeholder→UUID ao longo
-          de todos os arquivos da pasta — normas inseridas em arquivo A
-          ficam disponíveis para arquivo B que as referencia em anexos_normas
-        • _run_upsert_icms_jsons: passa o mesmo resolver global para todos
-          os blocos, eliminando as 220 falhas de norma_id=None em anexos_normas
+          de todos os arquivos da pasta
 
-v2.7 — NCM multi-valor explodido em linhas individuais:
-        • produtos_icms_st: campo ncm pode conter múltiplos NCMs separados
-          por ";" (ex: "3208; 3209; 3210.00") — cada NCM gera uma linha
-          independente com os demais campos duplicados, garantindo 1 NCM/linha
-        • _expandir_ncms(): nova função que faz o split, limpa espaços e
-          filtra valores vazios antes do insert
-
-v2.6 — Idempotência e RLS em produtos_icms_st:
-        • normas_legais: INSERT → UPSERT on_conflict=tipo_norma,numero,ano,
-          orgao_emissor — reexecuções recuperam o UUID existente em vez de
-          falhar com 23505; resolver registra corretamente para dependentes
-        • produtos_icms_st: mesmo padrão — upsert on_conflict=cest,ncm com
-          fallback de SELECT para recuperar UUID quando resp.data vier vazio
-        • _UPSERT_CONFLICT: mapa tabela → colunas de conflito para upsert
+v2.7 — NCM multi-valor explodido em linhas individuais
+v2.6 — Idempotência e RLS em produtos_icms_st
+v2.5 — Correção de regex _PH_RE (minúsculas e hífens)
+v2.4 — Correções críticas de RLS, colisão de variável, aliases e normas_legais
 """
 
 import os, re, io, json, base64, logging
@@ -68,12 +51,14 @@ log = logging.getLogger(__name__)
 
 # ── Variáveis de ambiente ─────────────────────────────────────────────────────
 SUPABASE_URL            = os.getenv("SUPABASE_URL", "")
-# v2.4: usa SERVICE_ROLE_KEY para bypassar RLS nos inserts do pipeline
 SUPABASE_KEY            = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY", "")
 OPENAI_API_KEY          = os.getenv("OPENAI_API_KEY", "")
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
 DRIVE_FOLDER_ID         = os.getenv("DRIVE_FOLDER_ID", "")
 DRIVE_FOLDER_ID_JSONS   = os.getenv("DRIVE_FOLDER_ID_JSONS", "")
+# v3.0: pasta Drive dedicada aos JSONs de produtos monofásicos
+# Pode ser a mesma que DRIVE_FOLDER_ID_JSONS ou uma pasta separada
+DRIVE_FOLDER_ID_MONO    = os.getenv("DRIVE_FOLDER_ID_MONO", "")
 
 # ── Imports opcionais ─────────────────────────────────────────────────────────
 try:    import pdfplumber;                         HAS_PDF     = True
@@ -96,7 +81,7 @@ try:
 except: HAS_GDRIVE = False
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Extrator Fiscal v2.9", version="2.9.0")
+app = FastAPI(title="Extrator Fiscal v3.0", version="3.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -106,7 +91,6 @@ app.add_middleware(
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if HAS_SB and SUPABASE_URL and SUPABASE_KEY else None
 
-# Log de diagnóstico para confirmar qual key está em uso
 if SUPABASE_KEY:
     _key_tipo = "service_role" if len(SUPABASE_KEY) > 200 else "anon (ATENÇÃO: pode falhar RLS)"
     log.info(f"Supabase key carregada: tipo={_key_tipo} len={len(SUPABASE_KEY)}")
@@ -147,7 +131,7 @@ CST_DESC = {
     "04":  "Monofásico — revenda alíquota zero",
     "06":  "Alíquota zero",
     "07":  "Isento",
-    "60":  "ICMS-ST cobrado anteriormente",   # v2.9: alias sem zero à esquerda
+    "60":  "ICMS-ST cobrado anteriormente",
     "060": "ICMS-ST cobrado anteriormente",
     "500": "CSOSN — ST cobrado anteriormente",
 }
@@ -600,7 +584,7 @@ def _svc():
 @app.get("/health")
 def health():
     return {
-        "status": "ok", "versao": "2.9.0",
+        "status": "ok", "versao": "3.0.0",
         "supabase": supabase is not None,
         "pdf": HAS_PDF, "xlsx": HAS_XLSX, "docx": HAS_DOCX, "gdrive": HAS_GDRIVE,
     }
@@ -671,10 +655,9 @@ async def _pasta(folder_id):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# UPSERT JSONs ICMS-ST  v2.9
+# UPSERT JSONs ICMS-ST  v2.9  (inalterado)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# ── Ordem de inserção respeitando FKs ────────────────────────────────────────
 _TABLE_ORDER = [
     "normas_legais",
     "anexos_fiscais",
@@ -685,7 +668,6 @@ _TABLE_ORDER = [
     "produtos_icms_st",
 ]
 
-# ── Colunas aceitas por tabela (schema real do Supabase) ─────────────────────
 _SCHEMA_COLS: dict[str, set] = {
     "normas_legais": {
         "tipo_norma", "numero", "ano", "ementa", "data_publicacao",
@@ -717,7 +699,6 @@ _SCHEMA_COLS: dict[str, set] = {
     },
 }
 
-# ── Aliases: campo_no_json → campo_no_schema ─────────────────────────────────
 _FIELD_ALIASES: dict[str, dict[str, str]] = {
     "normas_legais": {
         "tipo":               "tipo_norma",
@@ -731,13 +712,11 @@ _FIELD_ALIASES: dict[str, dict[str, str]] = {
     },
 }
 
-# ── Campos a ignorar completamente ───────────────────────────────────────────
 _IGNORE_FIELDS = frozenset({
     "ato", "dispositivos_afetados", "dispositivos_impactados", "ncm_produto",
     "ambito",
 })
 
-# ── Defaults para campos NOT NULL ausentes/nulos ─────────────────────────────
 _DEFAULTS: dict[str, dict] = {
     "normas_legais": {
         "tipo_norma": "Norma",
@@ -763,8 +742,6 @@ _DEFAULTS: dict[str, dict] = {
     },
 }
 
-# ── Regex para detectar placeholder de FK ────────────────────────────────────
-# v2.5: aceita letras minúsculas e hífens — ex: <NORMA_ID_conv_icms_51_2000>
 _PH_RE = re.compile(r"^<[A-Za-z0-9_\-]+>$")
 
 def _is_placeholder(v) -> bool:
@@ -775,29 +752,15 @@ def _is_blank(v) -> bool:
     if isinstance(v, str) and (v.strip() == "" or _is_placeholder(v)): return True
     return False
 
-
-# ── Sentinela para placeholder não-resolvível ────────────────────────────────
-# Quando o insert de normas_legais falha, registramos este sentinela no lugar
-# do UUID real. Assim _sanitize_unresolved pode detectar e logar corretamente
-# em vez de deixar a string "<NORMA_ID_...>" chegar ao Supabase.
 _SENTINEL_FAILED = "__FAILED__"
 
 
-# ── Resolver de placeholders → UUIDs reais ───────────────────────────────────
 class _Resolver:
-    """
-    Mantém mapa placeholder → UUID real por arquivo.
-    Registra e resolve chaves como '<ANEXO_ID_4_28>' → 'uuid-real'.
-
-    v2.4: register_failed() permite marcar um placeholder como "falhou" —
-    resolve() retorna None para esses casos em vez de logar "não resolvido".
-    """
     def __init__(self, filename: str = ""):
         self._map: dict[str, str] = {}
         self._file = filename
 
     def set_file(self, filename: str):
-        """Atualiza o arquivo atual para logs — mantém o mapa acumulado."""
         self._file = filename
 
     def register(self, placeholder: str, real_id: str):
@@ -806,7 +769,6 @@ class _Resolver:
             log.info(f"[icms] {self._file} — registrado {placeholder} = {real_id[:8]}…")
 
     def register_failed(self, placeholder: str):
-        """Marca placeholder como falhou — evita log de 'não resolvido' em cascata."""
         if placeholder:
             self._map[placeholder] = _SENTINEL_FAILED
             log.warning(
@@ -821,7 +783,6 @@ class _Resolver:
                 log.warning(f"[icms] {self._file} — placeholder não resolvido: {value}")
                 return None
             if resolved == _SENTINEL_FAILED:
-                # Já logado em register_failed — retorna None silenciosamente
                 return None
             return resolved
         return value
@@ -830,42 +791,21 @@ class _Resolver:
         return {k: self.resolve(v) for k, v in record.items()}
 
 
-# ── Normalização de um registro ───────────────────────────────────────────────
 def _normalizar_registro(table: str, raw: dict, filename: str) -> dict:
-    """
-    v2.4: aliases são aplicados ANTES do filtro de schema para que campos
-    renomeados não sejam descartados prematuramente.
-
-    Ordem:
-      1. Remove chaves com prefixo '_' (metadados internos)
-      2. Remove campos em _IGNORE_FIELDS
-      3. Aplica aliases (campo_json → campo_schema)  ← movido para antes do filtro
-      4. Remove campos fora do schema
-      5. Aplica defaults para campos obrigatórios ausentes/nulos
-    """
     result = {}
     aliases = _FIELD_ALIASES.get(table, {})
     schema  = _SCHEMA_COLS.get(table, set())
 
     for key, val in raw.items():
-        # 1. Ignorar chaves internas
         if key.startswith("_"):
             continue
-
-        # 2. Campos a ignorar explicitamente
         if key in _IGNORE_FIELDS:
             log.debug(f"[icms] {filename}/{table}: campo ignorado '{key}'")
             continue
-
-        # 3. Aplicar alias ANTES de checar o schema
         target_key = aliases.get(key, key)
-
         if target_key != key:
-            # Conversão especial: revogada (bool) → status (string)
             if key == "revogada" and target_key == "status":
                 val = "REVOGADO" if val else "ATIVO"
-
-            # Conflito: campo destino já preenchido
             if target_key in result:
                 log.warning(
                     f"[icms] {filename}/{table}: campo duplicado — "
@@ -875,17 +815,11 @@ def _normalizar_registro(table: str, raw: dict, filename: str) -> dict:
                 )
                 continue
             key = target_key
-
-        # 4. Fora do schema → logar e ignorar
         if key not in schema:
-            log.warning(
-                f"[icms] {filename}/{table}: campo '{key}' fora do schema — ignorado"
-            )
+            log.warning(f"[icms] {filename}/{table}: campo '{key}' fora do schema — ignorado")
             continue
-
         result[key] = val
 
-    # 5. Aplicar defaults para campos ausentes/nulos
     for field, default_val in _DEFAULTS.get(table, {}).items():
         if _is_blank(result.get(field)):
             result[field] = default_val
@@ -893,7 +827,6 @@ def _normalizar_registro(table: str, raw: dict, filename: str) -> dict:
     return result
 
 
-# ── Extração de seções ────────────────────────────────────────────────────────
 def _extrair_rows(section) -> list[dict]:
     if not section:
         return []
@@ -908,17 +841,11 @@ def _extrair_rows(section) -> list[dict]:
     return []
 
 
-# ── Campos FK uuid ────────────────────────────────────────────────────────────
 _UUID_FK_FIELDS = frozenset({
     "anexo_id", "norma_id", "anexo_fiscal_id", "norma_legal_id",
 })
 
 def _sanitize_unresolved(row: dict, filename: str, table: str) -> dict:
-    """
-    v2.4: verifica campos após resolução de placeholders.
-    Campos FK que ainda são placeholder (não resolvidos ou marcados como FAILED)
-    são setados para None com log detalhado.
-    """
     result = {}
     for k, v in row.items():
         if _is_placeholder(v):
@@ -934,7 +861,6 @@ def _sanitize_unresolved(row: dict, filename: str, table: str) -> dict:
     return result
 
 
-# ── Campos NOT NULL ────────────────────────────────────────────────────────────
 _NOT_NULL_COLS: dict[str, list[str]] = {
     "normas_legais":   ["tipo_norma", "numero", "ano"],
     "anexos_fiscais":  ["estado", "nome_completo"],
@@ -945,43 +871,24 @@ _NOT_NULL_COLS: dict[str, list[str]] = {
     "produtos_icms_st":           ["segmento", "ncm", "cest", "descricao", "ativo"],
 }
 
-# ── Tabelas que usam UPSERT (idempotente) em vez de INSERT puro ───────────────
-# v2.6: normas_legais e produtos_icms_st usam upsert para que reexecuções
-# do pipeline não falhem com 23505 e possam recuperar UUIDs existentes.
-# Demais tabelas (artigos, pontos_atencao, normas, comparativo) continuam
-# com INSERT puro pois não têm constraint UNIQUE confirmada no schema.
 _UPSERT_CONFLICT: dict[str, str] = {
-    "normas_legais":  "tipo_norma,numero,ano,orgao_emissor",
+    "normas_legais":    "tipo_norma,numero,ano,orgao_emissor",
     "produtos_icms_st": "cest,ncm,anexo_fiscal_id",
 }
 
 
-# ── Expansão de NCMs múltiplos em linhas individuais ─────────────────────────
-# v2.7: campo ncm pode conter vários NCMs separados por ";" nos JSONs.
-# Cada NCM gera um registro independente com os demais campos idênticos.
 def _expandir_ncms(row: dict) -> list[dict]:
-    """
-    Se o campo 'ncm' contiver separadores ";" ou ",", retorna uma lista com
-    um dict por NCM. Caso contrário retorna lista com o dict original.
-    Limpa espaços e ignora tokens vazios.
-    """
     ncm_raw = row.get("ncm") or ""
-    # Detectar separadores: ponto-e-vírgula tem prioridade, depois vírgula
-    # (vírgula só se não for parte do NCM, ex: "3208, 3209" — NCMs nunca têm vírgula)
     if ";" in str(ncm_raw):
         separador = ";"
     elif re.search(r"\d,\s*\d{4}", str(ncm_raw)):
-        # Padrão "3208, 3209" — vírgula entre números de 4+ dígitos
         separador = ","
     else:
         return [row]
-
     tokens = [t.strip() for t in str(ncm_raw).split(separador)]
-    tokens = [t for t in tokens if t]  # remover vazios
-
+    tokens = [t for t in tokens if t]
     if len(tokens) <= 1:
         return [row]
-
     rows = []
     for ncm in tokens:
         novo = dict(row)
@@ -991,16 +898,6 @@ def _expandir_ncms(row: dict) -> list[dict]:
 
 
 def _processar_bloco(bloco_data: dict, filename: str, resolver: _Resolver) -> dict:
-    """
-    v2.4: parâmetro renomeado de 'data' para 'bloco_data' para evitar
-    colisão com a variável local 'data_resp = resp.data' dentro do loop —
-    bug que no v2.3 corrompia silenciosamente a iteração de tabelas
-    subsequentes ao primeiro insert bem-sucedido.
-
-    Também: quando insert de normas_legais falha, chama resolver.register_failed()
-    para que dependentes (anexos_normas, produtos_icms_st) sejam descartados
-    com log claro em vez de gerar erros 22P02 em cascata.
-    """
     contadores = {t: 0 for t in _TABLE_ORDER}
     erros: list[str] = []
 
@@ -1009,7 +906,6 @@ def _processar_bloco(bloco_data: dict, filename: str, resolver: _Resolver) -> di
         if not rows:
             continue
 
-        # v2.7: expandir NCMs múltiplos (ex: "3208; 3209") em linhas individuais
         if table == "produtos_icms_st":
             rows_expandidas = []
             for r in rows:
@@ -1025,17 +921,10 @@ def _processar_bloco(bloco_data: dict, filename: str, resolver: _Resolver) -> di
 
         for row in rows:
             placeholder = row.get("_id_referencia")
-
-            # 1. Resolver placeholders de FK
             row_norm = resolver.resolve_all(dict(row))
-
-            # 2. Sanitizar placeholders residuais
             row_norm = _sanitize_unresolved(row_norm, filename, table)
-
-            # 3. Normalizar campos
             row_norm = _normalizar_registro(table, row_norm, filename)
 
-            # 4. Validar campos NOT NULL
             skip = False
             for col in _NOT_NULL_COLS.get(table, []):
                 if row_norm.get(col) is None:
@@ -1046,18 +935,12 @@ def _processar_bloco(bloco_data: dict, filename: str, resolver: _Resolver) -> di
                     skip = True
                     break
             if skip:
-                # Se for normas_legais, marcar placeholder como falhou para
-                # evitar cascata de erros 22P02 nos registros dependentes
                 if table == "normas_legais" and placeholder:
                     resolver.register_failed(placeholder)
                 ref = placeholder or str(list(row_norm.items())[:2])
                 erros.append(f"{table}:{ref}:null_not_null")
                 continue
 
-            # 5. INSERT ou UPSERT — UUID gerado/recuperado pelo Supabase
-            # v2.6: tabelas em _UPSERT_CONFLICT usam upsert para idempotência.
-            # Quando resp.data vier vazio (RLS bloqueia o SELECT de retorno mas
-            # permite o write), faz um SELECT explícito para recuperar o UUID.
             real_id = None
             insert_ok = False
             conflict_cols = _UPSERT_CONFLICT.get(table)
@@ -1074,8 +957,6 @@ def _processar_bloco(bloco_data: dict, filename: str, resolver: _Resolver) -> di
                 resp_data = resp.data
                 real_id = resp_data[0].get("id") if resp_data else None
 
-                # Fallback: RLS pode bloquear o SELECT de retorno mesmo após
-                # write bem-sucedido — buscar UUID explicitamente pelo conflito
                 if real_id is None and conflict_cols:
                     filter_cols = conflict_cols.split(",")
                     q = supabase.table(table).select("id")
@@ -1090,7 +971,6 @@ def _processar_bloco(bloco_data: dict, filename: str, resolver: _Resolver) -> di
                             f"[icms] {filename}/{table}: UUID recuperado via "
                             f"SELECT fallback — {real_id[:8]}…"
                         )
-
                 insert_ok = real_id is not None
 
             except Exception as e:
@@ -1104,11 +984,8 @@ def _processar_bloco(bloco_data: dict, filename: str, resolver: _Resolver) -> di
                     resolver.register(placeholder, real_id)
                 contadores[table] += 1
             else:
-                # Falhou — marcar placeholder como FAILED para cortar
-                # a cascata de erros 22P02 nos registros que dependem desta FK
                 if placeholder:
                     resolver.register_failed(placeholder)
-
                 ref = (
                     placeholder
                     or row_norm.get("ncm")
@@ -1124,7 +1001,6 @@ def _processar_bloco(bloco_data: dict, filename: str, resolver: _Resolver) -> di
 def _normalizar_blocos(data) -> list[dict]:
     if isinstance(data, list):
         return [b for b in data if isinstance(b, dict)]
-
     if isinstance(data, dict):
         if any(k in data for k in _TABLE_ORDER):
             return [data]
@@ -1133,13 +1009,11 @@ def _normalizar_blocos(data) -> list[dict]:
             if isinstance(block, dict) and any(t in block for t in _TABLE_ORDER)
         ]
         return blocos
-
     return []
 
 
-# ── Task principal em background ─────────────────────────────────────────────
 async def _run_upsert_icms_jsons(folder_id: str):
-    """Baixa todos os JSONs da pasta do Drive e faz upsert nas 7 tabelas."""
+    """Baixa todos os JSONs da pasta do Drive e faz upsert nas 7 tabelas ICMS-ST."""
     svc = _svc()
     if not svc:
         log.error("[icms] Falha na autenticação Google Drive")
@@ -1168,8 +1042,6 @@ async def _run_upsert_icms_jsons(folder_id: str):
 
     total  = {t: 0 for t in _TABLE_ORDER}
     erros_geral: list[str] = []
-
-    # v2.8: resolver global — acumula placeholder→UUID entre todos os arquivos
     resolver = _Resolver()
 
     for file_meta in files:
@@ -1189,8 +1061,6 @@ async def _run_upsert_icms_jsons(folder_id: str):
             erros_geral.append(f"download:{filename}")
             continue
 
-        # v2.8: resolver é global — reutilizado entre arquivos
-        # para que normas inseridas em arquivo A sejam acessíveis em arquivo B
         resolver.set_file(filename)
         blocos = _normalizar_blocos(bloco_json)
 
@@ -1210,7 +1080,297 @@ async def _run_upsert_icms_jsons(folder_id: str):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ENDPOINTS — ICMS-ST
+# PIPELINE MONOFÁSICOS v3.0 — leitura de JSON estruturado do Drive
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Colunas aceitas pela tabela produtos_monofasicos ─────────────────────────
+_SCHEMA_MONO = {
+    "ncm", "descricao", "base_legal", "lei", "vigencia_inicio", "vigencia_fim",
+    "ativo", "norma_legal_id", "normas_relacionadas", "content", "metadata",
+    "cst_pis", "cst_cofins", "natureza_receita", "aliq_pis_simples",
+    "aliq_cofins_simples", "aliq_pis_presumido", "aliq_cofins_presumido",
+    "aliq_pis_real", "aliq_cofins_real", "segmento", "descricao_cst",
+    "regime_tributario", "fonte_arquivo", "metodo_extracao", "updated_at",
+}
+
+# ── Mapa de segmento inferido a partir da descrição do grupo ─────────────────
+# Chave = fragmento do campo "group" no JSON (lowercase)
+_SEGMENTO_GRUPO: list[tuple[str, str]] = [
+    ("combustív",          "Combustíveis"),
+    ("derivados de petról","Combustíveis"),
+    ("farmacê",            "Medicamentos"),
+    ("farmaci",            "Medicamentos"),
+    ("higiene",            "Perfumaria e Higiene"),
+    ("cosmétic",           "Perfumaria e Higiene"),
+    ("veículos",           "Veículos"),
+    ("automotor",          "Veículos"),
+    ("bebida",             "Bebidas Alcoólicas"),
+    ("embalagem",          "Bebidas Alcoólicas"),
+    ("máquina",            "Materiais de Construção"),
+    ("equipament",         "Materiais de Construção"),
+    ("construção",         "Materiais de Construção"),
+]
+
+
+def _segmento_por_grupo(group_label: str) -> str:
+    """Infere segmento a partir da descrição do grupo no JSON."""
+    gl = group_label.lower()
+    for fragmento, segmento in _SEGMENTO_GRUPO:
+        if fragmento in gl:
+            return segmento
+    return "Não identificado"
+
+
+def _parse_aliq(valor: str | None) -> float | None:
+    """
+    Converte string de alíquota para float.
+    Ex: "2,7%" → 2.7  |  "var." → None  |  "–" → None  |  "0,0%" → 0.0
+    """
+    if not valor or str(valor).strip() in ("var.", "–", "-", ""):
+        return None
+    try:
+        return float(str(valor).replace("%", "").replace(",", ".").strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def _mapear_item_monofasico(
+    item: dict,
+    group_label: str,
+    filename: str,
+) -> dict | None:
+    """
+    Converte um item do JSON de produtos monofásicos para o schema da tabela.
+
+    Estrutura esperada do item:
+      ncm              → ncm (limpar pontos)
+      description      → descricao
+      cst_mono_04      → cst_pis / cst_cofins
+      al_pis_maj_percent   → aliq_pis_presumido  (alíquota majorada = fabricante)
+      al_cof_maj_percent   → aliq_cofins_presumido
+      al_pis_norm_percent  → aliq_pis_real
+      al_cof_norm_percent  → aliq_cofins_real
+      cod_nat_rec      → natureza_receita
+      legal_basis      → base_legal + lei (extraída via regex)
+
+    Campos sem correspondência no JSON (ficam None / default):
+      vigencia_inicio, vigencia_fim, norma_legal_id, normas_relacionadas,
+      content, metadata, embedding, aliq_pis_simples, aliq_cofins_simples,
+      regime_tributario
+    """
+    ncm_raw = str(item.get("ncm") or "").strip()
+    ncm     = limpar_ncm(ncm_raw)
+    if not ncm:
+        log.warning(f"[mono] {filename}: NCM inválido '{ncm_raw}' — item ignorado")
+        return None
+
+    descricao    = str(item.get("description") or "").strip() or "Sem descrição"
+    cst_raw      = str(item.get("cst_mono_04") or "04").strip()
+    legal_basis  = str(item.get("legal_basis") or "").strip() or None
+    cod_nat      = str(item.get("cod_nat_rec") or "").strip() or None
+    group_num    = str(item.get("group_number") or "").strip() or None
+
+    # Alíquotas — "maj" = majorada (fabricante) → presumido; "norm" = normal → real
+    aliq_pis_pres  = _parse_aliq(item.get("al_pis_maj_percent"))
+    aliq_cof_pres  = _parse_aliq(item.get("al_cof_maj_percent"))
+    aliq_pis_real  = _parse_aliq(item.get("al_pis_norm_percent"))
+    aliq_cof_real  = _parse_aliq(item.get("al_cof_norm_percent"))
+
+    # Extrai lei do campo legal_basis (ex: "Lei 9.718/98; Decreto 8.395/2015")
+    lei = None
+    if legal_basis:
+        lei_match = RE_LEI.search(legal_basis)
+        lei = "Lei " + lei_match.group(1) if lei_match else None
+
+    segmento = _segmento_por_grupo(group_label)
+
+    return {
+        "ncm":                   ncm,
+        "descricao":             descricao,
+        "base_legal":            legal_basis,
+        "lei":                   lei,
+        "vigencia_inicio":       None,
+        "vigencia_fim":          None,
+        "ativo":                 True,
+        "norma_legal_id":        None,
+        "normas_relacionadas":   None,
+        "content":               None,
+        "metadata":              None,
+        # Campos PIS/COFINS
+        "cst_pis":               cst_raw,
+        "cst_cofins":            cst_raw,
+        "natureza_receita":      cod_nat,
+        "aliq_pis_simples":      None,
+        "aliq_cofins_simples":   None,
+        "aliq_pis_presumido":    aliq_pis_pres,
+        "aliq_cofins_presumido": aliq_cof_pres,
+        "aliq_pis_real":         aliq_pis_real,
+        "aliq_cofins_real":      aliq_cof_real,
+        "segmento":              segmento,
+        "descricao_cst":         CST_DESC.get(cst_raw),
+        "regime_tributario":     "monofasico",
+        "fonte_arquivo":         filename,
+        "metodo_extracao":       "json_estruturado",
+        "updated_at":            now(),
+    }
+
+
+def _extrair_registros_mono(data: dict, filename: str) -> list[dict]:
+    """
+    Lê a chave 'produtos_monofasicos' do JSON (lista de grupos com items)
+    e retorna lista de dicts prontos para upsert em produtos_monofasicos.
+
+    Estrutura esperada:
+    {
+      "produtos_monofasicos": [
+        {
+          "group": "GRUPO 100 – COMBUSTÍVEIS E DERIVADOS DE PETRÓLEO",
+          "items": [ { "ncm": "...", ... }, ... ]
+        },
+        ...
+      ]
+    }
+    """
+    grupos = data.get("produtos_monofasicos")
+    if not grupos or not isinstance(grupos, list):
+        log.warning(f"[mono] '{filename}': chave 'produtos_monofasicos' ausente ou vazia")
+        return []
+
+    registros: list[dict] = []
+    total_itens = 0
+    total_invalidos = 0
+
+    for grupo in grupos:
+        if not isinstance(grupo, dict):
+            continue
+        group_label = str(grupo.get("group") or "")
+        items       = grupo.get("items") or []
+
+        if not isinstance(items, list):
+            log.warning(f"[mono] '{filename}' grupo '{group_label}': 'items' não é lista")
+            continue
+
+        log.info(
+            f"[mono] '{filename}' grupo '{group_label}': "
+            f"{len(items)} item(ns)"
+        )
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            total_itens += 1
+            registro = _mapear_item_monofasico(item, group_label, filename)
+            if registro:
+                registros.append(registro)
+            else:
+                total_invalidos += 1
+
+    log.info(
+        f"[mono] '{filename}': {len(registros)} registro(s) válidos | "
+        f"{total_invalidos} ignorados (NCM inválido)"
+    )
+    return registros
+
+
+async def _run_upsert_monofasicos(folder_id: str):
+    """
+    v3.0 — Pipeline independente para produtos_monofasicos.
+    Baixa todos os JSONs da pasta do Drive que contenham a chave
+    'produtos_monofasicos' e faz upsert em produtos_monofasicos com
+    on_conflict=ncm.
+
+    Não compartilha estado nem tabelas com o pipeline ICMS-ST.
+    """
+    svc = _svc()
+    if not svc:
+        log.error("[mono] Falha na autenticação Google Drive")
+        return
+
+    try:
+        files = (
+            svc.files()
+            .list(
+                q=(
+                    f"'{folder_id}' in parents "
+                    f"and mimeType='application/json' "
+                    f"and trashed=false"
+                ),
+                fields="files(id, name)",
+                pageSize=100,
+            )
+            .execute()
+            .get("files", [])
+        )
+    except Exception as e:
+        log.error(f"[mono] Listar pasta Drive: {e}")
+        return
+
+    log.info(f"[mono] {len(files)} arquivo(s) JSON na pasta {folder_id}")
+
+    total_inseridos = 0
+    total_erros     = 0
+
+    for file_meta in files:
+        file_id  = file_meta["id"]
+        filename = file_meta["name"]
+        log.info(f"[mono] baixando '{filename}'…")
+
+        # ── Download ──────────────────────────────────────────────────────────
+        try:
+            buf = io.BytesIO()
+            dl  = MediaIoBaseDownload(buf, svc.files().get_media(fileId=file_id))
+            done = False
+            while not done:
+                _, done = dl.next_chunk()
+            data_json = json.loads(buf.getvalue().decode("utf-8"))
+        except Exception as e:
+            log.error(f"[mono] Falha ao baixar '{filename}': {e}")
+            total_erros += 1
+            continue
+
+        # ── Extrair e mapear registros ────────────────────────────────────────
+        registros = _extrair_registros_mono(data_json, filename)
+        if not registros:
+            log.warning(f"[mono] '{filename}': nenhum registro extraído — ignorado")
+            continue
+
+        # ── Deduplicação por NCM (mantém registro com mais campos preenchidos)
+        registros = dedup(registros)
+        log.info(f"[mono] '{filename}': {len(registros)} registro(s) após dedup")
+
+        # ── Upsert em lote com on_conflict=ncm ───────────────────────────────
+        # Insere em batches de 500 para evitar payload excessivo
+        BATCH = 500
+        for i in range(0, len(registros), BATCH):
+            lote = registros[i:i + BATCH]
+            try:
+                resp = (
+                    supabase.table("produtos_monofasicos")
+                    .upsert(lote, on_conflict="ncm")
+                    .execute()
+                )
+                n_ok = len(resp.data) if resp.data else len(lote)
+                total_inseridos += n_ok
+                log.info(
+                    f"[mono] '{filename}' lote {i//BATCH + 1}: "
+                    f"{n_ok} registro(s) upserted em produtos_monofasicos"
+                )
+            except Exception as e:
+                log.error(
+                    f"[mono] '{filename}' lote {i//BATCH + 1}: "
+                    f"upsert erro — {e}"
+                )
+                total_erros += len(lote)
+
+    log.info(
+        f"[mono] ✓ CONCLUÍDO — "
+        f"total inseridos/atualizados: {total_inseridos} | "
+        f"erros: {total_erros}"
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENDPOINTS — ICMS-ST (inalterados)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/upsert-icms-st")
@@ -1257,6 +1417,91 @@ def status_icms_st():
             resultado[table] = f"erro: {e}"
     resultado["timestamp"] = datetime.utcnow().isoformat()
     return resultado
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENDPOINTS — MONOFÁSICOS v3.0
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/upsert-monofasicos")
+async def upsert_monofasicos(
+    background_tasks: BackgroundTasks,
+    folder_id: Optional[str] = None,
+):
+    """
+    v3.0 — Lê JSONs com a chave 'produtos_monofasicos' de uma pasta do
+    Google Drive e faz upsert em produtos_monofasicos (on_conflict=ncm).
+
+    Rotina completamente independente do pipeline ICMS-ST.
+
+    Query params:
+      folder_id  — ID da pasta no Drive (opcional se DRIVE_FOLDER_ID_MONO
+                   estiver definido no ambiente)
+    """
+    if not supabase:
+        raise HTTPException(503, "Supabase não configurado")
+    if not HAS_GDRIVE:
+        raise HTTPException(503, "Biblioteca Google Drive não disponível")
+
+    fid = folder_id or DRIVE_FOLDER_ID_MONO or DRIVE_FOLDER_ID_JSONS
+    if not fid:
+        raise HTTPException(
+            400,
+            "Informe folder_id na query ou defina DRIVE_FOLDER_ID_MONO no ambiente"
+        )
+
+    background_tasks.add_task(_run_upsert_monofasicos, fid)
+    return {
+        "status":    "iniciado",
+        "folder_id": fid,
+        "tabela":    "produtos_monofasicos",
+        "info":      "Acompanhe os logs do Railway para progresso detalhado",
+    }
+
+
+@app.get("/status-monofasicos")
+def status_monofasicos():
+    """
+    v3.0 — Resumo dos registros em produtos_monofasicos agrupados por segmento.
+    """
+    if not supabase:
+        return {"erro": "Supabase não configurado"}
+    try:
+        # Contagem total
+        total_resp = (
+            supabase.table("produtos_monofasicos")
+            .select("id", count="exact")
+            .execute()
+        )
+        total = total_resp.count
+
+        # Contagem de ativos
+        ativos_resp = (
+            supabase.table("produtos_monofasicos")
+            .select("id", count="exact")
+            .eq("ativo", True)
+            .execute()
+        )
+        ativos = ativos_resp.count
+
+        # Amostra dos 5 registros mais recentes
+        recentes_resp = (
+            supabase.table("produtos_monofasicos")
+            .select("ncm, descricao, segmento, cst_pis, fonte_arquivo, updated_at")
+            .order("updated_at", desc=True)
+            .limit(5)
+            .execute()
+        )
+
+        return {
+            "total":     total,
+            "ativos":    ativos,
+            "inativos":  (total or 0) - (ativos or 0),
+            "recentes":  recentes_resp.data or [],
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+    except Exception as e:
+        return {"erro": str(e)}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
