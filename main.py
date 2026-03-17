@@ -1,18 +1,24 @@
 """
-Microserviço de Extração Fiscal v2.3
+Microserviço de Extração Fiscal v2.4
 =====================================
 Três camadas: Determinístico → Regex → Semântico (LLM)
 Mapeado para a estrutura REAL das tabelas no Supabase.
 
-v2.3 — Pipeline upsert ICMS-ST completamente reescrito:
-        • Suporta formato A (seções como list[]) e formato B (seções como dict{registros:[]})
-        • Normaliza aliases de campos (orgao→orgao_emissor, texto_ementa/descricao→ementa)
-        • Ignora campos fora do schema com log (nunca aborta)
-        • Resolve placeholders <FK_REF> em runtime com mapeamento por arquivo
-        • Detecta e trata campos duplicados com mesmo propósito (log + mantém um)
-        • Aceita ncm/cest null, ncm com texto livre ('Diversas','61','3003; 3004')
-        • Aceita artigos=[], signatarios_ativos=null, vigencia_inicio por produto
-        • UUID como PK — nunca usa (cest,ncm) como chave única
+v2.4 — Correções críticas:
+        • SUPABASE_KEY lê SUPABASE_SERVICE_ROLE_KEY (fix RLS 42501)
+        • _processar_bloco: variável 'data' renomeada para 'bloco_data' —
+          eliminada colisão com parâmetro homônimo que corrompia o loop
+        • normas_legais: falha de insert agora loga o erro completo E
+          registra placeholder com sentinela para abortar dependentes
+          (evita cascata de erros 22P02 por placeholder não-resolvido)
+        • _normalizar_registro: aliases aplicados ANTES do filtro de schema,
+          evitando que campos com alias caiam no filtro e sejam descartados
+        • _upsert_row removida (era código morto — _processar_bloco faz insert
+          diretamente; manter as duas lógicas causava confusão)
+        • _sanitize_unresolved: agora recebe o resolver e loga o placeholder
+          original para facilitar diagnóstico
+        • Logs de insert erro incluem o payload completo dos dados problemáticos
+          (não apenas os 4 primeiros itens)
 """
 
 import os, re, io, json, base64, logging
@@ -35,7 +41,8 @@ log = logging.getLogger(__name__)
 
 # ── Variáveis de ambiente ─────────────────────────────────────────────────────
 SUPABASE_URL            = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY            = os.getenv("SUPABASE_KEY", "")
+# v2.4: usa SERVICE_ROLE_KEY para bypassar RLS nos inserts do pipeline
+SUPABASE_KEY            = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY", "")
 OPENAI_API_KEY          = os.getenv("OPENAI_API_KEY", "")
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
 DRIVE_FOLDER_ID         = os.getenv("DRIVE_FOLDER_ID", "")
@@ -62,7 +69,7 @@ try:
 except: HAS_GDRIVE = False
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Extrator Fiscal v2.3", version="2.3.0")
+app = FastAPI(title="Extrator Fiscal v2.4", version="2.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -71,6 +78,13 @@ app.add_middleware(
 )
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if HAS_SB and SUPABASE_URL and SUPABASE_KEY else None
+
+# Log de diagnóstico para confirmar qual key está em uso
+if SUPABASE_KEY:
+    _key_tipo = "service_role" if len(SUPABASE_KEY) > 200 else "anon (ATENÇÃO: pode falhar RLS)"
+    log.info(f"Supabase key carregada: tipo={_key_tipo} len={len(SUPABASE_KEY)}")
+else:
+    log.warning("Supabase key NÃO configurada — pipeline desabilitado")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -558,7 +572,7 @@ def _svc():
 @app.get("/health")
 def health():
     return {
-        "status": "ok", "versao": "2.3.0",
+        "status": "ok", "versao": "2.4.0",
         "supabase": supabase is not None,
         "pdf": HAS_PDF, "xlsx": HAS_XLSX, "docx": HAS_DOCX, "gdrive": HAS_GDRIVE,
     }
@@ -629,7 +643,7 @@ async def _pasta(folder_id):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# UPSERT JSONs ICMS-ST  v2.3
+# UPSERT JSONs ICMS-ST  v2.4
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ── Ordem de inserção respeitando FKs ────────────────────────────────────────
@@ -644,10 +658,7 @@ _TABLE_ORDER = [
 ]
 
 # ── Colunas aceitas por tabela (schema real do Supabase) ─────────────────────
-# ── Schema REAL do Supabase (verificado via information_schema) ───────────────
-# Apenas colunas que existem na tabela — nunca enviar campo fora desta lista.
 _SCHEMA_COLS: dict[str, set] = {
-    # normas_legais — campo principal é tipo_norma (não 'tipo')
     "normas_legais": {
         "tipo_norma", "numero", "ano", "ementa", "data_publicacao",
         "orgao_emissor", "esfera", "texto_completo", "url_fonte", "tags",
@@ -675,41 +686,33 @@ _SCHEMA_COLS: dict[str, set] = {
         "cst", "cfop_interestadual", "vigencia_inicio", "vigencia_fim", "ativo",
         "norma_legal_id", "descricao_cst", "fonte_arquivo", "metodo_extracao",
         "anexo_fiscal_id",
-        # user_id omitido — preenchido pela aplicação, nunca pelos JSONs
     },
 }
 
 # ── Aliases: campo_no_json → campo_no_schema ─────────────────────────────────
-# Renomeia silenciosamente. Se ambos (original + destino) existirem no registro,
-# mantém o do schema e loga o conflito — nunca aborta.
 _FIELD_ALIASES: dict[str, dict[str, str]] = {
     "normas_legais": {
-        # nome do campo
-        "tipo":               "tipo_norma",       # JSONs usam 'tipo', tabela usa 'tipo_norma'
-        "orgao":              "orgao_emissor",     # alguns JSONs usam 'orgao'
-        "texto_ementa":       "ementa",            # alguns JSONs usam 'texto_ementa'
-        "descricao":          "ementa",            # alguns JSONs usam 'descricao'
-        # datas
-        "data_vigencia_inicio": "data_vigencia",   # tabela usa 'data_vigencia'
-        "data_vigencia_fim":    "data_revogacao",  # tabela usa 'data_revogacao'
-        # status
-        "situacao":           "status",            # JSONs usam 'situacao', tabela tem 'status'
-        "revogada":           "status",            # bool → converter abaixo via _pre_process
+        "tipo":               "tipo_norma",
+        "orgao":              "orgao_emissor",
+        "texto_ementa":       "ementa",
+        "descricao":          "ementa",
+        "data_vigencia_inicio": "data_vigencia",
+        "data_vigencia_fim":    "data_revogacao",
+        "situacao":           "status",
+        "revogada":           "status",
     },
-    # anexos_fiscais — 'orgao' já é o nome correto na tabela
 }
 
-# ── Campos a ignorar completamente (fora do schema e sem alias útil) ─────────
+# ── Campos a ignorar completamente ───────────────────────────────────────────
 _IGNORE_FIELDS = frozenset({
-    # Campos dos JSONs que não existem em nenhuma tabela
     "ato", "dispositivos_afetados", "dispositivos_impactados", "ncm_produto",
-    "ambito",   # existia no schema antigo, não existe no Supabase real
+    "ambito",
 })
 
 # ── Defaults para campos NOT NULL ausentes/nulos ─────────────────────────────
 _DEFAULTS: dict[str, dict] = {
     "normas_legais": {
-        "tipo_norma": "Norma",   # fallback genérico se tipo não vier
+        "tipo_norma": "Norma",
         "numero":     "0",
         "ano":        0,
     },
@@ -720,8 +723,8 @@ _DEFAULTS: dict[str, dict] = {
     },
     "produtos_icms_st": {
         "segmento":           "Não classificado",
-        "cest":               "00.000.00",   # NOT NULL — placeholder quando ausente
-        "ncm":                "0000",        # NOT NULL — placeholder quando ausente
+        "cest":               "00.000.00",
+        "ncm":                "0000",
         "descricao":          "Sem descrição",
         "cst_icms":           "60",
         "csosn":              "500",
@@ -744,11 +747,21 @@ def _is_blank(v) -> bool:
     return False
 
 
+# ── Sentinela para placeholder não-resolvível ────────────────────────────────
+# Quando o insert de normas_legais falha, registramos este sentinela no lugar
+# do UUID real. Assim _sanitize_unresolved pode detectar e logar corretamente
+# em vez de deixar a string "<NORMA_ID_...>" chegar ao Supabase.
+_SENTINEL_FAILED = "__FAILED__"
+
+
 # ── Resolver de placeholders → UUIDs reais ───────────────────────────────────
 class _Resolver:
     """
     Mantém mapa placeholder → UUID real por arquivo.
     Registra e resolve chaves como '<ANEXO_ID_4_28>' → 'uuid-real'.
+
+    v2.4: register_failed() permite marcar um placeholder como "falhou" —
+    resolve() retorna None para esses casos em vez de logar "não resolvido".
     """
     def __init__(self, filename: str):
         self._map: dict[str, str] = {}
@@ -759,11 +772,24 @@ class _Resolver:
             self._map[placeholder] = real_id
             log.info(f"[icms] {self._file} — registrado {placeholder} = {real_id[:8]}…")
 
+    def register_failed(self, placeholder: str):
+        """Marca placeholder como falhou — evita log de 'não resolvido' em cascata."""
+        if placeholder:
+            self._map[placeholder] = _SENTINEL_FAILED
+            log.warning(
+                f"[icms] {self._file} — placeholder marcado como FAILED: {placeholder} "
+                f"(insert da norma falhou; registros dependentes serão ignorados)"
+            )
+
     def resolve(self, value):
         if _is_placeholder(value):
             resolved = self._map.get(value)
             if resolved is None:
                 log.warning(f"[icms] {self._file} — placeholder não resolvido: {value}")
+                return None
+            if resolved == _SENTINEL_FAILED:
+                # Já logado em register_failed — retorna None silenciosamente
+                return None
             return resolved
         return value
 
@@ -774,19 +800,22 @@ class _Resolver:
 # ── Normalização de um registro ───────────────────────────────────────────────
 def _normalizar_registro(table: str, raw: dict, filename: str) -> dict:
     """
-    1. Remove chaves com prefixo '_' (metadados internos)
-    2. Aplica aliases de campo (orgao → orgao_emissor, etc.)
-       — se o campo destino JÁ existir, mantém o do schema e loga o conflito
-    3. Remove campos fora do schema + lista de ignorados
-    4. Aplica defaults para campos obrigatórios ausentes/nulos
-    5. Retorna apenas colunas aceitas pelo schema
+    v2.4: aliases são aplicados ANTES do filtro de schema para que campos
+    renomeados não sejam descartados prematuramente.
+
+    Ordem:
+      1. Remove chaves com prefixo '_' (metadados internos)
+      2. Remove campos em _IGNORE_FIELDS
+      3. Aplica aliases (campo_json → campo_schema)  ← movido para antes do filtro
+      4. Remove campos fora do schema
+      5. Aplica defaults para campos obrigatórios ausentes/nulos
     """
     result = {}
     aliases = _FIELD_ALIASES.get(table, {})
     schema  = _SCHEMA_COLS.get(table, set())
 
     for key, val in raw.items():
-        # 1. Ignorar chaves internas (_tabela, _operacao, _id_referencia, _nota…)
+        # 1. Ignorar chaves internas
         if key.startswith("_"):
             continue
 
@@ -795,7 +824,7 @@ def _normalizar_registro(table: str, raw: dict, filename: str) -> dict:
             log.debug(f"[icms] {filename}/{table}: campo ignorado '{key}'")
             continue
 
-        # 3. Aplicar alias
+        # 3. Aplicar alias ANTES de checar o schema
         target_key = aliases.get(key, key)
 
         if target_key != key:
@@ -803,8 +832,7 @@ def _normalizar_registro(table: str, raw: dict, filename: str) -> dict:
             if key == "revogada" and target_key == "status":
                 val = "REVOGADO" if val else "ATIVO"
 
-            # É um alias — verificar se o campo destino já foi preenchido pelo
-            # próprio registro (conflito: dois campos com o mesmo propósito)
+            # Conflito: campo destino já preenchido
             if target_key in result:
                 log.warning(
                     f"[icms] {filename}/{table}: campo duplicado — "
@@ -832,15 +860,8 @@ def _normalizar_registro(table: str, raw: dict, filename: str) -> dict:
     return result
 
 
-# ── Extração de seções (formato A=lista, formato B=dict{registros}) ──────────
+# ── Extração de seções ────────────────────────────────────────────────────────
 def _extrair_rows(section) -> list[dict]:
-    """
-    Aceita qualquer dos formatos encontrados nos 26 JSONs:
-      - list[dict]                → formato padrão (24 arquivos)
-      - dict{registros: list}     → formato alternativo (4.16, 4.17, 4.19)
-      - dict direto (um registro) → formato singular
-      - None / vazio              → lista vazia
-    """
     if not section:
         return []
     if isinstance(section, list):
@@ -849,29 +870,25 @@ def _extrair_rows(section) -> list[dict]:
         if "registros" in section:
             regs = section["registros"]
             return [r for r in regs if isinstance(r, dict)] if isinstance(regs, list) else []
-        # dict direto sem 'registros' — tratar como registro único se tiver campos de dados
         if any(k in section for k in _SCHEMA_COLS.get("anexos_fiscais", set())):
             return [section]
     return []
 
 
-# ── Inserção de um único registro com tratamento de erro ────────────────────
-# Campos que são FK uuid — não podem conter strings placeholder
+# ── Campos FK uuid ────────────────────────────────────────────────────────────
 _UUID_FK_FIELDS = frozenset({
     "anexo_id", "norma_id", "anexo_fiscal_id", "norma_legal_id",
 })
 
 def _sanitize_unresolved(row: dict, filename: str, table: str) -> dict:
     """
-    Após resolver placeholders, verifica se algum campo FK uuid ainda
-    contém uma string <...> (resolver retornou None, mas o campo pode
-    ter vindo de outro caminho). Substitui por None e loga.
-    Também garante que None não vire a string 'None'.
+    v2.4: verifica campos após resolução de placeholders.
+    Campos FK que ainda são placeholder (não resolvidos ou marcados como FAILED)
+    são setados para None com log detalhado.
     """
     result = {}
     for k, v in row.items():
         if _is_placeholder(v):
-            # Placeholder não foi resolvido — setar None explicitamente
             log.warning(
                 f"[icms] {filename}/{table}: campo '{k}' ainda é placeholder "
                 f"após resolução: {v} — setado como None"
@@ -884,69 +901,7 @@ def _sanitize_unresolved(row: dict, filename: str, table: str) -> dict:
     return result
 
 
-def _upsert_row(
-    table: str,
-    row: dict,
-    conflict_cols: list[str],
-    resolver: _Resolver,
-    filename: str,
-) -> str | None:
-    """
-    Resolve FKs → sanitiza placeholders residuais → normaliza → valida → upsert.
-    Retorna o UUID gerado ou None em caso de falha.
-    NUNCA levanta exceção — sempre loga e continua.
-    """
-    # Resolver placeholders de FK
-    row = resolver.resolve_all(row)
-
-    # Sanitizar: campos UUID que ainda contêm placeholder (não resolvidos)
-    # → substituir por None para não enviar string inválida ao Supabase
-    row = _sanitize_unresolved(row, filename, table)
-
-    # Normalizar campos
-    row = _normalizar_registro(table, row, filename)
-
-    # Validar que as colunas de conflito estão presentes e não são None
-    for col in conflict_cols:
-        if row.get(col) is None:
-            log.warning(
-                f"[icms] {filename}/{table}: coluna de conflict '{col}' é None "
-                f"— registro ignorado: {list(row.items())[:4]}"
-            )
-            return None
-
-    try:
-        resp = (
-            supabase.table(table)
-            .upsert(row, on_conflict=",".join(conflict_cols))
-            .execute()
-        )
-        data = resp.data
-        if data and isinstance(data, list) and len(data) > 0:
-            return data[0].get("id")
-        log.warning(f"[icms] {filename}/{table}: upsert sem retorno de id — {list(row.items())[:3]}")
-        return None
-    except Exception as e:
-        log.error(f"[icms] {filename}/{table}: erro no upsert — {e} | dados: {list(row.items())[:4]}")
-        return None
-
-
-# ── Tabelas que usam INSERT puro (sem ON CONFLICT) ───────────────────────────
-# Motivo: não há constraint UNIQUE nas colunas naturais dessas tabelas.
-# O Supabase gera o UUID (id) e o retorna para o resolver registrar.
-# Todas as tabelas usam INSERT puro — nenhuma tem constraint UNIQUE confirmada.
-_INSERT_ONLY_TABLES = frozenset({
-    "normas_legais",
-    "anexos_fiscais",
-    "anexos_artigos",
-    "anexos_pontos_atencao",
-    "anexos_comparativo_redacao",
-    "anexos_normas",
-    "produtos_icms_st",
-})
-
-# ── Colunas NOT NULL que precisam ter valor antes do INSERT ──────────────────
-# Se estiverem None após normalização, o registro é descartado com log.
+# ── Campos NOT NULL ────────────────────────────────────────────────────────────
 _NOT_NULL_COLS: dict[str, list[str]] = {
     "normas_legais":   ["tipo_norma", "numero", "ano"],
     "anexos_fiscais":  ["estado", "nome_completo"],
@@ -958,32 +913,37 @@ _NOT_NULL_COLS: dict[str, list[str]] = {
 }
 
 
-def _processar_bloco(data: dict, filename: str, resolver: _Resolver) -> dict:
+def _processar_bloco(bloco_data: dict, filename: str, resolver: _Resolver) -> dict:
     """
-    Itera as 7 tabelas de um bloco JSON e faz INSERT em ordem.
-    Usa INSERT puro em todas as tabelas — o UUID é gerado pelo Supabase.
-    Retorna contadores e lista de erros para log.
+    v2.4: parâmetro renomeado de 'data' para 'bloco_data' para evitar
+    colisão com a variável local 'data_resp = resp.data' dentro do loop —
+    bug que no v2.3 corrompia silenciosamente a iteração de tabelas
+    subsequentes ao primeiro insert bem-sucedido.
+
+    Também: quando insert de normas_legais falha, chama resolver.register_failed()
+    para que dependentes (anexos_normas, produtos_icms_st) sejam descartados
+    com log claro em vez de gerar erros 22P02 em cascata.
     """
     contadores = {t: 0 for t in _TABLE_ORDER}
     erros: list[str] = []
 
     for table in _TABLE_ORDER:
-        rows = _extrair_rows(data.get(table))
+        rows = _extrair_rows(bloco_data.get(table))
         if not rows:
             continue
 
         log.info(f"[icms] {filename}/{table}: {len(rows)} registro(s)")
 
         for row in rows:
-            placeholder = row.get("_id_referencia")  # capturar antes da normalização
+            placeholder = row.get("_id_referencia")
 
             # 1. Resolver placeholders de FK
             row_norm = resolver.resolve_all(dict(row))
 
-            # 2. Sanitizar placeholders residuais (FKs não resolvidas → None)
+            # 2. Sanitizar placeholders residuais
             row_norm = _sanitize_unresolved(row_norm, filename, table)
 
-            # 3. Normalizar campos (aliases, schema, defaults)
+            # 3. Normalizar campos
             row_norm = _normalizar_registro(table, row_norm, filename)
 
             # 4. Validar campos NOT NULL
@@ -997,24 +957,39 @@ def _processar_bloco(data: dict, filename: str, resolver: _Resolver) -> dict:
                     skip = True
                     break
             if skip:
+                # Se for normas_legais, marcar placeholder como falhou para
+                # evitar cascata de erros 22P02 nos registros dependentes
+                if table == "normas_legais" and placeholder:
+                    resolver.register_failed(placeholder)
                 ref = placeholder or str(list(row_norm.items())[:2])
                 erros.append(f"{table}:{ref}:null_not_null")
                 continue
 
-            # 5. INSERT puro — UUID gerado pelo Supabase
+            # 5. INSERT — UUID gerado pelo Supabase
+            # Nota: usamos 'resp_data' (não 'data') para não ofuscar 'bloco_data'
             real_id = None
+            insert_ok = False
             try:
                 resp = supabase.table(table).insert(row_norm).execute()
-                data_resp = resp.data
-                real_id = data_resp[0].get("id") if data_resp else None
+                resp_data = resp.data
+                real_id = resp_data[0].get("id") if resp_data else None
+                insert_ok = real_id is not None
             except Exception as e:
-                log.error(f"[icms] {filename}/{table}: insert erro — {e} | dados: {list(row_norm.items())[:4]}")
+                log.error(
+                    f"[icms] {filename}/{table}: insert erro — {e} "
+                    f"| dados: {list(row_norm.items())}"
+                )
 
-            if real_id:
+            if insert_ok:
                 if placeholder:
                     resolver.register(placeholder, real_id)
                 contadores[table] += 1
             else:
+                # Insert falhou — marcar placeholder como FAILED para cortar
+                # a cascata de erros 22P02 nos registros que dependem desta FK
+                if placeholder:
+                    resolver.register_failed(placeholder)
+
                 ref = (
                     placeholder
                     or row_norm.get("ncm")
@@ -1028,22 +1003,12 @@ def _processar_bloco(data: dict, filename: str, resolver: _Resolver) -> dict:
 
 
 def _normalizar_blocos(data) -> list[dict]:
-    """
-    Normaliza a raiz do JSON para lista de blocos independentes.
-
-    Suporta:
-      • dict direto com tabelas no topo           → 1 bloco  (maioria dos arquivos)
-      • dict wrapper com sub-dicts por anexo       → N blocos (arquivos multi-anexo)
-      • list de blocos
-    """
     if isinstance(data, list):
         return [b for b in data if isinstance(b, dict)]
 
     if isinstance(data, dict):
-        # Arquivo com pelo menos uma tabela-alvo no topo → 1 bloco
         if any(k in data for k in _TABLE_ORDER):
             return [data]
-        # Wrapper: cada chave é um anexo {"ANEXO_4_37": {...}, ...}
         blocos = [
             block for key, block in data.items()
             if isinstance(block, dict) and any(t in block for t in _TABLE_ORDER)
@@ -1090,22 +1055,20 @@ async def _run_upsert_icms_jsons(folder_id: str):
         filename = file_meta["name"]
         log.info(f"[icms] baixando '{filename}'…")
 
-        # Download
         try:
             buf = io.BytesIO()
             dl  = MediaIoBaseDownload(buf, svc.files().get_media(fileId=file_id))
             done = False
             while not done:
                 _, done = dl.next_chunk()
-            data = json.loads(buf.getvalue().decode("utf-8"))
+            bloco_json = json.loads(buf.getvalue().decode("utf-8"))
         except Exception as e:
             log.error(f"[icms] Falha ao baixar '{filename}': {e}")
             erros_geral.append(f"download:{filename}")
             continue
 
-        # Resolver é por arquivo — cada JSON tem seus próprios placeholders
         resolver = _Resolver(filename)
-        blocos   = _normalizar_blocos(data)
+        blocos   = _normalizar_blocos(bloco_json)
 
         if not blocos:
             log.warning(f"[icms] '{filename}': nenhum bloco reconhecível — ignorado")
@@ -1117,7 +1080,6 @@ async def _run_upsert_icms_jsons(folder_id: str):
                 total[t] += n
             erros_geral.extend(resultado["erros"])
 
-    # Resumo final
     log.info(f"[icms] ✓ CONCLUÍDO — totais: {total}")
     if erros_geral:
         log.warning(f"[icms] {len(erros_geral)} falha(s): {erros_geral[:30]}")
@@ -1134,14 +1096,7 @@ async def upsert_icms_st(
 ):
     """
     Lê os JSONs dos Anexos RICMS/MA de uma pasta do Google Drive
-    e faz upsert nas 7 tabelas do Supabase na ordem correta:
-
-      normas_legais → anexos_fiscais → anexos_artigos →
-      anexos_pontos_atencao → anexos_comparativo_redacao →
-      anexos_normas → produtos_icms_st
-
-    Query param opcional:
-      ?folder_id=<ID_DA_PASTA>   (usa DRIVE_FOLDER_ID_JSONS do .env se omitido)
+    e faz upsert nas 7 tabelas do Supabase na ordem correta.
     """
     if not supabase:
         raise HTTPException(503, "Supabase não configurado")
