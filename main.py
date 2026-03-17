@@ -1,5 +1,5 @@
 """
-Microserviço de Extração Fiscal v2.4
+Microserviço de Extração Fiscal v2.5
 =====================================
 Três camadas: Determinístico → Regex → Semântico (LLM)
 Mapeado para a estrutura REAL das tabelas no Supabase.
@@ -17,8 +17,10 @@ v2.4 — Correções críticas:
           diretamente; manter as duas lógicas causava confusão)
         • _sanitize_unresolved: agora recebe o resolver e loga o placeholder
           original para facilitar diagnóstico
-        • Logs de insert erro incluem o payload completo dos dados problemáticos
-          (não apenas os 4 primeiros itens)
+        • _PH_RE: regex corrigido para aceitar letras minúsculas e hífens —
+          placeholders como <NORMA_ID_conv_icms_51_2000> não eram detectados
+          pelo padrão anterior [A-Z0-9_]+ e chegavam intactos ao Supabase,
+          causando erro 22P02 mesmo após o resolve_all() e _sanitize_unresolved()
 """
 
 import os, re, io, json, base64, logging
@@ -69,7 +71,7 @@ try:
 except: HAS_GDRIVE = False
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Extrator Fiscal v2.4", version="2.4.0")
+app = FastAPI(title="Extrator Fiscal v2.5", version="2.5.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -572,7 +574,7 @@ def _svc():
 @app.get("/health")
 def health():
     return {
-        "status": "ok", "versao": "2.4.0",
+        "status": "ok", "versao": "2.5.0",
         "supabase": supabase is not None,
         "pdf": HAS_PDF, "xlsx": HAS_XLSX, "docx": HAS_DOCX, "gdrive": HAS_GDRIVE,
     }
@@ -736,7 +738,8 @@ _DEFAULTS: dict[str, dict] = {
 }
 
 # ── Regex para detectar placeholder de FK ────────────────────────────────────
-_PH_RE = re.compile(r"^<[A-Z0-9_]+>$")
+# v2.5: aceita letras minúsculas e hífens — ex: <NORMA_ID_conv_icms_51_2000>
+_PH_RE = re.compile(r"^<[A-Za-z0-9_\-]+>$")
 
 def _is_placeholder(v) -> bool:
     return isinstance(v, str) and bool(_PH_RE.match(v))
