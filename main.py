@@ -1,5 +1,5 @@
 """
-Microserviço de Extração Fiscal v2.8
+Microserviço de Extração Fiscal v2.9
 =====================================
 Três camadas: Determinístico → Regex → Semântico (LLM)
 Mapeado para a estrutura REAL das tabelas no Supabase.
@@ -18,6 +18,12 @@ v2.4 — Correções críticas:
 v2.5 — Correção de regex:
         • _PH_RE: aceita letras minúsculas e hífens —
           <NORMA_ID_conv_icms_51_2000> não era detectado pelo padrão anterior
+
+v2.9 — descricao_cst nula para cst_icms="60":
+        • CST_DESC: adicionado alias "60" → "ICMS-ST cobrado anteriormente"
+          (JSONs gravam "60" sem zero à esquerda, mas o dict só tinha "060")
+        • mk_st: descricao_cst agora usa o cst real do registro em vez de
+          "060" fixo, com fallback para "060" se não encontrar
 
 v2.8 — Resolver global entre arquivos para anexos_normas:
         • _GlobalResolver: singleton que acumula placeholder→UUID ao longo
@@ -90,7 +96,7 @@ try:
 except: HAS_GDRIVE = False
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Extrator Fiscal v2.8", version="2.8.0")
+app = FastAPI(title="Extrator Fiscal v2.9", version="2.9.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -141,6 +147,7 @@ CST_DESC = {
     "04":  "Monofásico — revenda alíquota zero",
     "06":  "Alíquota zero",
     "07":  "Isento",
+    "60":  "ICMS-ST cobrado anteriormente",   # v2.9: alias sem zero à esquerda
     "060": "ICMS-ST cobrado anteriormente",
     "500": "CSOSN — ST cobrado anteriormente",
 }
@@ -269,7 +276,7 @@ def mk_st(ncm, cest, descricao, segmento, cst, csosn,
         "vigencia_inicio":        vigencia_inicio,
         "vigencia_fim":           vigencia_fim,
         "ativo":                  vigencia_fim is None,
-        "descricao_cst":          CST_DESC.get("060"),
+        "descricao_cst":          CST_DESC.get(cst or "060") or CST_DESC.get("060"),
         "fonte_arquivo":          fonte,
         "metodo_extracao":        metodo,
         "updated_at":             now(),
@@ -593,7 +600,7 @@ def _svc():
 @app.get("/health")
 def health():
     return {
-        "status": "ok", "versao": "2.8.0",
+        "status": "ok", "versao": "2.9.0",
         "supabase": supabase is not None,
         "pdf": HAS_PDF, "xlsx": HAS_XLSX, "docx": HAS_DOCX, "gdrive": HAS_GDRIVE,
     }
@@ -664,7 +671,7 @@ async def _pasta(folder_id):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# UPSERT JSONs ICMS-ST  v2.8
+# UPSERT JSONs ICMS-ST  v2.9
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ── Ordem de inserção respeitando FKs ────────────────────────────────────────
