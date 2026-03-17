@@ -1,5 +1,5 @@
 """
-Microserviço de Extração Fiscal v2.6
+Microserviço de Extração Fiscal v2.7
 =====================================
 Três camadas: Determinístico → Regex → Semântico (LLM)
 Mapeado para a estrutura REAL das tabelas no Supabase.
@@ -18,6 +18,13 @@ v2.4 — Correções críticas:
 v2.5 — Correção de regex:
         • _PH_RE: aceita letras minúsculas e hífens —
           <NORMA_ID_conv_icms_51_2000> não era detectado pelo padrão anterior
+
+v2.7 — NCM multi-valor explodido em linhas individuais:
+        • produtos_icms_st: campo ncm pode conter múltiplos NCMs separados
+          por ";" (ex: "3208; 3209; 3210.00") — cada NCM gera uma linha
+          independente com os demais campos duplicados, garantindo 1 NCM/linha
+        • _expandir_ncms(): nova função que faz o split, limpa espaços e
+          filtra valores vazios antes do insert
 
 v2.6 — Idempotência e RLS em produtos_icms_st:
         • normas_legais: INSERT → UPSERT on_conflict=tipo_norma,numero,ano,
@@ -76,7 +83,7 @@ try:
 except: HAS_GDRIVE = False
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Extrator Fiscal v2.6", version="2.6.0")
+app = FastAPI(title="Extrator Fiscal v2.7", version="2.7.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -579,7 +586,7 @@ def _svc():
 @app.get("/health")
 def health():
     return {
-        "status": "ok", "versao": "2.6.0",
+        "status": "ok", "versao": "2.7.0",
         "supabase": supabase is not None,
         "pdf": HAS_PDF, "xlsx": HAS_XLSX, "docx": HAS_DOCX, "gdrive": HAS_GDRIVE,
     }
@@ -650,7 +657,7 @@ async def _pasta(folder_id):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# UPSERT JSONs ICMS-ST  v2.6
+# UPSERT JSONs ICMS-ST  v2.7
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ── Ordem de inserção respeitando FKs ────────────────────────────────────────
@@ -931,6 +938,40 @@ _UPSERT_CONFLICT: dict[str, str] = {
 }
 
 
+# ── Expansão de NCMs múltiplos em linhas individuais ─────────────────────────
+# v2.7: campo ncm pode conter vários NCMs separados por ";" nos JSONs.
+# Cada NCM gera um registro independente com os demais campos idênticos.
+def _expandir_ncms(row: dict) -> list[dict]:
+    """
+    Se o campo 'ncm' contiver separadores ";" ou ",", retorna uma lista com
+    um dict por NCM. Caso contrário retorna lista com o dict original.
+    Limpa espaços e ignora tokens vazios.
+    """
+    ncm_raw = row.get("ncm") or ""
+    # Detectar separadores: ponto-e-vírgula tem prioridade, depois vírgula
+    # (vírgula só se não for parte do NCM, ex: "3208, 3209" — NCMs nunca têm vírgula)
+    if ";" in str(ncm_raw):
+        separador = ";"
+    elif re.search(r"\d,\s*\d{4}", str(ncm_raw)):
+        # Padrão "3208, 3209" — vírgula entre números de 4+ dígitos
+        separador = ","
+    else:
+        return [row]
+
+    tokens = [t.strip() for t in str(ncm_raw).split(separador)]
+    tokens = [t for t in tokens if t]  # remover vazios
+
+    if len(tokens) <= 1:
+        return [row]
+
+    rows = []
+    for ncm in tokens:
+        novo = dict(row)
+        novo["ncm"] = ncm
+        rows.append(novo)
+    return rows
+
+
 def _processar_bloco(bloco_data: dict, filename: str, resolver: _Resolver) -> dict:
     """
     v2.4: parâmetro renomeado de 'data' para 'bloco_data' para evitar
@@ -949,6 +990,18 @@ def _processar_bloco(bloco_data: dict, filename: str, resolver: _Resolver) -> di
         rows = _extrair_rows(bloco_data.get(table))
         if not rows:
             continue
+
+        # v2.7: expandir NCMs múltiplos (ex: "3208; 3209") em linhas individuais
+        if table == "produtos_icms_st":
+            rows_expandidas = []
+            for r in rows:
+                rows_expandidas.extend(_expandir_ncms(r))
+            if len(rows_expandidas) != len(rows):
+                log.info(
+                    f"[icms] {filename}/{table}: {len(rows)} registro(s) "
+                    f"expandidos para {len(rows_expandidas)} (NCMs múltiplos)"
+                )
+                rows = rows_expandidas
 
         log.info(f"[icms] {filename}/{table}: {len(rows)} registro(s)")
 
