@@ -1,5 +1,5 @@
 """
-Microserviço de Extração Fiscal v3.4
+Microserviço de Extração Fiscal v3.4 
 =====================================
 Três camadas: Determinístico → Regex → Semântico (LLM)
 Mapeado para a estrutura REAL das tabelas no Supabase.
