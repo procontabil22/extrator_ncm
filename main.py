@@ -1,8 +1,15 @@
 """
-Microserviço de Extração Fiscal v3.4 
+Microserviço de Extração Fiscal v3.5
 =====================================
 Três camadas: Determinístico → Regex → Semântico (LLM)
 Mapeado para a estrutura REAL das tabelas no Supabase.
+
+v3.5 — Correção trigger normas_legais_versoes (2026-03-19):
+        • normas_legais usa INSERT puro em vez de upsert
+        • Evita disparo do trigger trigger_versionar_norma em UPDATE
+        • Se norma já existe (23505), recupera UUID via SELECT
+        • Resolve erro: duplicate key value violates unique constraint
+          "normas_legais_versoes_norma_id_versao_key"
 
 v3.4 — Correções de persistência relacional (2026-03-19):
         • CORREÇÃO 1 — _FIELD_ALIASES["anexos_normas"] adicionado:
@@ -99,7 +106,7 @@ try:
     HAS_GDRIVE = True
 except: HAS_GDRIVE = False
 
-app = FastAPI(title="Extrator Fiscal v3.4", version="3.4.0")
+app = FastAPI(title="Extrator Fiscal v3.5", version="3.5.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -571,7 +578,7 @@ def _svc():
 @app.get("/health")
 def health():
     return {
-        "status": "ok", "versao": "3.4.0",
+        "status": "ok", "versao": "3.5.0",
         "supabase": supabase is not None,
         "pdf": HAS_PDF, "xlsx": HAS_XLSX, "docx": HAS_DOCX, "gdrive": HAS_GDRIVE,
         "generated_cols_mono": sorted(_GENERATED_COLS_MONO),
@@ -978,33 +985,65 @@ def _processar_bloco(bloco_data: dict, filename: str, resolver: _Resolver) -> di
             real_id = None
             insert_ok = False
             conflict_cols = _UPSERT_CONFLICT.get(table)
+
             try:
-                if conflict_cols:
+                # ── v3.5: normas_legais usa INSERT puro (sem UPDATE) ──────────
+                # O trigger trigger_versionar_norma dispara em BEFORE UPDATE e
+                # insere versão em normas_legais_versoes. Se a norma já existe
+                # e foi tocada nesta execução, a versão já está lá → erro 23505.
+                # Solução: INSERT simples. Se conflito unique, recupera UUID.
+                if table == "normas_legais" and conflict_cols:
+                    try:
+                        resp = supabase.table(table).insert(row_norm).execute()
+                        resp_data = resp.data
+                        real_id = resp_data[0].get("id") if resp_data else None
+                    except Exception as e_insert:
+                        if "23505" in str(e_insert) or "unique" in str(e_insert).lower():
+                            filter_cols = conflict_cols.split(",")
+                            q = supabase.table(table).select("id")
+                            for col in filter_cols:
+                                val = row_norm.get(col)
+                                if val is not None:
+                                    q = q.eq(col, val)
+                            fallback = q.limit(1).execute()
+                            if fallback.data:
+                                real_id = fallback.data[0].get("id")
+                                log.info(
+                                    f"[icms] {filename}/{table}: norma já existe "
+                                    f"— UUID recuperado via SELECT: {real_id[:8]}…"
+                                )
+                        else:
+                            raise e_insert
+
+                # ── todas as outras tabelas: upsert normal ────────────────────
+                elif conflict_cols:
                     resp = (
                         supabase.table(table)
                         .upsert(row_norm, on_conflict=conflict_cols)
                         .execute()
                     )
+                    resp_data = resp.data
+                    real_id = resp_data[0].get("id") if resp_data else None
+
+                    if real_id is None:
+                        filter_cols = conflict_cols.split(",")
+                        q = supabase.table(table).select("id")
+                        for col in filter_cols:
+                            val = row_norm.get(col)
+                            if val is not None:
+                                q = q.eq(col, val)
+                        fallback = q.limit(1).execute()
+                        if fallback.data:
+                            real_id = fallback.data[0].get("id")
+                            log.info(
+                                f"[icms] {filename}/{table}: UUID recuperado via "
+                                f"SELECT fallback — {real_id[:8]}…"
+                            )
                 else:
                     resp = supabase.table(table).insert(row_norm).execute()
+                    resp_data = resp.data
+                    real_id = resp_data[0].get("id") if resp_data else None
 
-                resp_data = resp.data
-                real_id = resp_data[0].get("id") if resp_data else None
-
-                if real_id is None and conflict_cols:
-                    filter_cols = conflict_cols.split(",")
-                    q = supabase.table(table).select("id")
-                    for col in filter_cols:
-                        val = row_norm.get(col)
-                        if val is not None:
-                            q = q.eq(col, val)
-                    fallback = q.limit(1).execute()
-                    if fallback.data:
-                        real_id = fallback.data[0].get("id")
-                        log.info(
-                            f"[icms] {filename}/{table}: UUID recuperado via "
-                            f"SELECT fallback — {real_id[:8]}…"
-                        )
                 insert_ok = real_id is not None
 
             except Exception as e:
