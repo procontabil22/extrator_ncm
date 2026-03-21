@@ -1,8 +1,21 @@
 """
-Microserviço de Extração Fiscal v3.8
+Microserviço de Extração Fiscal v3.9
 =====================================
 Três camadas: Determinístico → Regex → Semântico (LLM)
 Mapeado para a estrutura REAL das tabelas no Supabase.
+
+v3.9 — Correção _run_upsert_monofasicos: preserva _motor_extra para o motor (2026-03-21):
+        • BUG CORRIGIDO — _filtrar_payload_mono era aplicado sobre o lote
+          ANTES de chamar _upsert_motor_tributario, removendo _motor_extra
+          e deixando o motor tributário sem as alíquotas necessárias.
+        • CORREÇÃO: lote original (com _motor_extra) vai para
+          _upsert_motor_tributario; lote_mono (filtrado) vai para
+          produtos_monofasicos. Duas variáveis distintas por iteração.
+        • Também resolve o erro PGRST204 "Could not find the
+          'aliq_cofins_presumido' column": o campo não vazava pelo
+          _filtrar_payload_mono, mas pelo lote ser passado com _motor_extra
+          contendo os campos antigos que eram injetados erroneamente.
+        • Nenhuma outra lógica alterada.
 
 v3.8 — produtos_monofasicos como cadastro base puro (2026-03-21):
         • DECISÃO ARQUITETURAL: produtos_monofasicos é cadastro base de NCMs.
@@ -165,7 +178,7 @@ try:
     HAS_GDRIVE = True
 except: HAS_GDRIVE = False
 
-app = FastAPI(title="Extrator Fiscal v3.8", version="3.8.0")
+app = FastAPI(title="Extrator Fiscal v3.9", version="3.9.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -214,25 +227,9 @@ CST_DESC = {
 
 # =============================================================================
 # LOOKUP DE FUNDAMENTAÇÃO JURÍDICA POR NCM
-# Carregado do arquivo fundamentacao_lookup.json presente na mesma pasta
-# do microserviço (ou em FUNDAMENTACAO_LOOKUP_PATH no ambiente).
-# Usado por _preparar_payload_motor() para enriquecer o campo
-# fundamentacao_resumida nas tabelas do motor tributário.
-# =============================================================================
-
-# =============================================================================
-# LOOKUP DE FUNDAMENTAÇÃO JURÍDICA POR NCM
-# Carregado do Google Drive na inicialização do serviço.
-# O arquivo fundamentacao_lookup.json deve estar na mesma pasta apontada
-# por DRIVE_FOLDER_ID_MONO (mesma pasta dos demais JSONs monofásicos).
-# Fallback: arquivo local para desenvolvimento/testes.
 # =============================================================================
 
 def _carregar_lookup_drive() -> dict:
-    """
-    Baixa fundamentacao_lookup.json do Google Drive e retorna o dicionário
-    {ncm: texto_fundamentacao}. Chamado uma vez na inicialização.
-    """
     if not HAS_GDRIVE:
         return {}
 
@@ -246,7 +243,6 @@ def _carregar_lookup_drive() -> dict:
         if not svc:
             return {}
 
-        # Busca o arquivo pelo nome exato na pasta
         resultado = (
             svc.files()
             .list(
@@ -285,17 +281,10 @@ def _carregar_lookup_drive() -> dict:
 
 
 def _carregar_lookup_fundamentacao() -> dict:
-    """
-    Carrega o lookup de fundamentação jurídica na seguinte ordem de prioridade:
-      1. Google Drive (pasta DRIVE_FOLDER_ID_MONO) — produção
-      2. Arquivo local (desenvolvimento/testes)
-    """
-    # Tenta Drive primeiro
     lookup = _carregar_lookup_drive()
     if lookup:
         return lookup
 
-    # Fallback: arquivo local
     caminhos = [
         os.getenv("FUNDAMENTACAO_LOOKUP_PATH", ""),
         os.path.join(os.path.dirname(__file__), "fundamentacao_lookup.json"),
@@ -348,7 +337,6 @@ SEGMENTOS = {
 _GENERATED_COLS_MONO: frozenset = frozenset({})
 
 # Campos que foram removidos da produtos_monofasicos em v3.8
-# Garantia extra: mesmo que entrem no payload, são filtrados aqui
 _REMOVED_COLS_MONO: frozenset = frozenset({
     "aliq_pis_simples", "aliq_cofins_simples",
     "aliq_pis_presumido", "aliq_cofins_presumido",
@@ -651,7 +639,8 @@ def salvar(mono, st):
             supabase.table("produtos_monofasicos").upsert(mono_filtrado, on_conflict="ncm").execute()
             r["mono"] = len(mono_filtrado)
             # ── v3.7: espelho nas tabelas do motor tributário ─────────────────
-            motor = _upsert_motor_tributario(mono_filtrado, origem="extrair-ncms")
+            # Passa `mono` (original, com _motor_extra) para o motor
+            motor = _upsert_motor_tributario(mono, origem="extrair-ncms")
             if motor["erros"]:
                 r["erros"].extend(motor["erros"])
         except Exception as e: r["erros"].append(f"mono:{str(e)[:200]}"); log.error(e)
@@ -758,7 +747,7 @@ def _svc():
 @app.get("/health")
 def health():
     return {
-        "status": "ok", "versao": "3.8.0",
+        "status": "ok", "versao": "3.9.0",
         "supabase": supabase is not None,
         "pdf": HAS_PDF, "xlsx": HAS_XLSX, "docx": HAS_DOCX, "gdrive": HAS_GDRIVE,
         "removed_cols_mono": sorted(_REMOVED_COLS_MONO - {"_motor_extra"}),
@@ -870,11 +859,6 @@ _SCHEMA_COLS: dict = {
         "anexo_id", "artigo", "dispositivo", "redacao_anterior",
         "redacao_vigente", "data_mudanca", "norma_que_alterou",
     },
-    # ── v3.4 CORREÇÃO 4 ──────────────────────────────────────────────────────
-    # Adicionados "anexo_fiscal_id" e "norma_legal_id" como aliases aceitos
-    # pelo schema — _FIELD_ALIASES resolve para "anexo_id"/"norma_id" antes
-    # de chegar aqui, mas mantemos ambos para compatibilidade retroativa
-    # com JSONs que já usavam os nomes antigos sem passar por alias.
     "anexos_normas": {
         "anexo_id", "norma_id", "papel",
         "anexo_fiscal_id", "norma_legal_id", "tipo_relacao",  # aliases aceitos
@@ -888,13 +872,6 @@ _SCHEMA_COLS: dict = {
     },
 }
 
-# ── v3.4 CORREÇÃO 1 ──────────────────────────────────────────────────────────
-# Adicionados aliases para anexos_normas:
-#   "anexo_fiscal_id" → "anexo_id"   (nome real na tabela)
-#   "norma_legal_id"  → "norma_id"   (nome real na tabela)
-#   "tipo_relacao"    → "papel"       (nome real na tabela)
-# Isso resolve os 3 FAILED do log: os campos eram ignorados por nome errado,
-# causando falha no NOT NULL de "anexo_id" e "norma_id".
 _FIELD_ALIASES: dict = {
     "normas_legais": {
         "tipo":                 "tipo_norma",
@@ -907,9 +884,9 @@ _FIELD_ALIASES: dict = {
         "revogada":             "status",
     },
     "anexos_normas": {
-        "anexo_fiscal_id": "anexo_id",    # v3.4: alias principal
-        "norma_legal_id":  "norma_id",    # v3.4: alias principal
-        "tipo_relacao":    "papel",        # v3.4: alias para campo "papel"
+        "anexo_fiscal_id": "anexo_id",
+        "norma_legal_id":  "norma_id",
+        "tipo_relacao":    "papel",
     },
 }
 
@@ -992,14 +969,9 @@ class _Resolver:
         return {k: self.resolve(v) for k, v in record.items()}
 
 
-# ── v3.4 CORREÇÃO 5 ──────────────────────────────────────────────────────────
-# _GlobalResolver: singleton que herda _Resolver e persiste o mapa entre
-# arquivos. Instanciado uma vez em _run_upsert_icms_jsons e passado a todos
-# os blocos, garantindo que um placeholder registrado no arquivo A seja
-# resolvido no arquivo B (ex: norma base num arquivo, produtos em outro).
 class _GlobalResolver(_Resolver):
     """Resolver compartilhado entre todos os arquivos de uma execução."""
-    pass  # herda tudo de _Resolver; a diferença é que é instanciado UMA VEZ
+    pass
 
 
 def _normalizar_registro(table: str, raw: dict, filename: str) -> dict:
@@ -1078,19 +1050,13 @@ _NOT_NULL_COLS: dict = {
     "anexos_artigos":  ["anexo_id", "numero"],
     "anexos_pontos_atencao":      ["anexo_id", "descricao"],
     "anexos_comparativo_redacao": ["anexo_id", "artigo"],
-    # ── v3.4: NOT NULL agora usa os nomes REAIS da tabela (pós-alias) ────────
     "anexos_normas":              ["anexo_id", "norma_id"],
     "produtos_icms_st":           ["segmento", "ncm", "cest", "descricao", "ativo"],
 }
 
-# ── v3.4 CORREÇÕES 2 e 3 ─────────────────────────────────────────────────────
-# CORREÇÃO 2: "anexos_fiscais" adicionado com on_conflict="sigla_anexo,estado"
-#             Evita duplicatas a cada re-execução do pipeline
-# CORREÇÃO 3: "normas_legais" corrigido — removido "orgao_emissor" (nullable)
-#             "tipo_norma,numero,ano" é único e nunca nulo
 _UPSERT_CONFLICT: dict = {
-    "normas_legais":    "tipo_norma,numero,ano",           # v3.4: removido orgao_emissor (nullable)
-    "anexos_fiscais":   "sigla_anexo,estado",              # v3.4: adicionado — evita duplicatas
+    "normas_legais":    "tipo_norma,numero,ano",
+    "anexos_fiscais":   "sigla_anexo,estado",
     "produtos_icms_st": "cest,ncm,anexo_fiscal_id",
 }
 
@@ -1143,11 +1109,6 @@ def _processar_bloco(bloco_data: dict, filename: str, resolver: _Resolver) -> di
             row_norm = _sanitize_unresolved(row_norm, filename, table)
             row_norm = _normalizar_registro(table, row_norm, filename)
 
-            # ── v3.4: para anexos_normas, remover campos alias residuais ─────
-            # Após _normalizar_registro, campos como "anexo_fiscal_id" e
-            # "norma_legal_id" já foram mapeados para "anexo_id"/"norma_id".
-            # Se ambos aparecerem (original + alias), o warning de duplicado
-            # já é emitido. Aqui garantimos que só os nomes reais seguem.
             if table == "anexos_normas":
                 row_norm.pop("anexo_fiscal_id", None)
                 row_norm.pop("norma_legal_id", None)
@@ -1174,11 +1135,6 @@ def _processar_bloco(bloco_data: dict, filename: str, resolver: _Resolver) -> di
             conflict_cols = _UPSERT_CONFLICT.get(table)
 
             try:
-                # ── v3.5: normas_legais usa INSERT puro (sem UPDATE) ──────────
-                # O trigger trigger_versionar_norma dispara em BEFORE UPDATE e
-                # insere versão em normas_legais_versoes. Se a norma já existe
-                # e foi tocada nesta execução, a versão já está lá → erro 23505.
-                # Solução: INSERT simples. Se conflito unique, recupera UUID.
                 if table == "normas_legais" and conflict_cols:
                     try:
                         resp = supabase.table(table).insert(row_norm).execute()
@@ -1202,7 +1158,6 @@ def _processar_bloco(bloco_data: dict, filename: str, resolver: _Resolver) -> di
                         else:
                             raise e_insert
 
-                # ── todas as outras tabelas: upsert normal ────────────────────
                 elif conflict_cols:
                     resp = (
                         supabase.table(table)
@@ -1302,10 +1257,6 @@ async def _run_upsert_icms_jsons(folder_id: str):
     total  = {t: 0 for t in _TABLE_ORDER}
     erros_geral: list = []
 
-    # ── v3.4 CORREÇÃO 5 ──────────────────────────────────────────────────────
-    # Usa _GlobalResolver em vez de _Resolver local — o mapa de placeholders
-    # persiste entre todos os arquivos da pasta, resolvendo referências
-    # cruzadas (norma inserida no arquivo A → resolvida no arquivo B).
     resolver = _GlobalResolver()
 
     for file_meta in files:
@@ -1344,62 +1295,48 @@ async def _run_upsert_icms_jsons(folder_id: str):
 
 
 # =============================================================================
-# PIPELINE MONOFÁSICOS v3.4 (inalterado em relação ao v3.3)
+# PIPELINE MONOFÁSICOS v3.9
 # =============================================================================
 
 _SCHEMA_MONO = {
-    # Identificação do NCM
     "ncm", "descricao", "segmento",
-    # Classificação tributária (sem alíquotas — estão nas tabelas do motor)
     "cst_pis", "cst_cofins", "descricao_cst", "natureza_receita",
-    # Base legal
     "base_legal", "lei", "norma_legal_id", "normas_relacionadas",
-    # Vigência
     "vigencia_inicio", "vigencia_fim", "ativo",
-    # Semântico
     "content", "metadata",
-    # Rastreabilidade
     "fonte_arquivo", "metodo_extracao", "updated_at",
 }
 
 _SEGMENTO_GRUPO: list = [
-    # Combustíveis
     ("combustív",           "Combustíveis"),
     ("derivados de petról", "Combustíveis"),
     ("petróleo",            "Combustíveis"),
     ("biodiesel",           "Combustíveis"),
     ("energia elétr",       "Combustíveis"),
-    # Medicamentos / Farmácia
     ("farmacê",             "Medicamentos"),
     ("farmaci",             "Medicamentos"),
     ("fármacos",            "Medicamentos"),
     ("medicament",          "Medicamentos"),
     ("produtos farmac",     "Medicamentos"),
-    # Perfumaria e Higiene
     ("higiene",             "Perfumaria e Higiene"),
     ("cosmétic",            "Perfumaria e Higiene"),
     ("perfumaria",          "Perfumaria e Higiene"),
     ("cosméticos",          "Perfumaria e Higiene"),
-    # Veículos
     ("veículos automotor",  "Veículos"),
     ("automotor",           "Veículos"),
     ("veículos",            "Veículos"),
     ("motocicleta",         "Veículos"),
-    # Bebidas
     ("bebida",              "Bebidas Alcoólicas"),
     ("cerveja",             "Bebidas Alcoólicas"),
     ("vinho",               "Bebidas Alcoólicas"),
     ("suco",                "Bebidas Alcoólicas"),
     ("bebidas frias",       "Bebidas Alcoólicas"),
-    # Embalagens para bebidas
     ("embalagem",           "Bebidas Alcoólicas"),
-    # Máquinas / Equipamentos / Construção
     ("máquina",             "Materiais de Construção"),
     ("equipament",          "Materiais de Construção"),
     ("construção",          "Materiais de Construção"),
     ("agrícola",            "Materiais de Construção"),
     ("hortícola",           "Materiais de Construção"),
-    # Produtos Alimentícios / Cesta Básica
     ("cesta básica",        "Produtos Alimentícios"),
     ("aliment",             "Produtos Alimentícios"),
     ("laticín",             "Produtos Alimentícios"),
@@ -1410,7 +1347,6 @@ _SEGMENTO_GRUPO: list = [
     ("arroz",               "Produtos Alimentícios"),
     ("trigo",               "Produtos Alimentícios"),
     ("óleo",                "Produtos Alimentícios"),
-    # Saúde / Ortopédicos
     ("saúde",               "Saúde"),
     ("ortopéd",             "Saúde"),
     ("prótese",             "Saúde"),
@@ -1418,7 +1354,6 @@ _SEGMENTO_GRUPO: list = [
     ("portadores de defici","Saúde"),
     ("audição",             "Saúde"),
     ("lentes",              "Saúde"),
-    # Aeronaves / Embarcações
     ("aeronave",            "Aeronaves e Embarcações"),
     ("helicóptero",         "Aeronaves e Embarcações"),
     ("avião",               "Aeronaves e Embarcações"),
@@ -1452,7 +1387,6 @@ def _mapear_item_monofasico(item: dict, group_label: str, filename: str):
         log.warning(f"[mono] {filename}: NCM inválido '{ncm_raw}' — item ignorado")
         return None
 
-    # Descrição — tenta todas as variações de nome do campo
     descricao = (
         str(item.get("descricao") or
             item.get("description") or
@@ -1461,7 +1395,6 @@ def _mapear_item_monofasico(item: dict, group_label: str, filename: str):
         or "Sem descrição"
     )
 
-    # CST — tenta todas as variações de nome do campo
     cst_raw = str(
         item.get("cst_pis") or
         item.get("cst_mono_04") or
@@ -1472,7 +1405,6 @@ def _mapear_item_monofasico(item: dict, group_label: str, filename: str):
     if cst_raw.isdigit() and len(cst_raw) > 2 and int(cst_raw) < 100:
         cst_raw = str(int(cst_raw)).zfill(2)
 
-    # Base legal — tenta todas as variações de nome do campo
     legal_basis = (
         str(item.get("base_legal") or
             item.get("legal_basis") or
@@ -1483,9 +1415,6 @@ def _mapear_item_monofasico(item: dict, group_label: str, filename: str):
 
     cod_nat = str(item.get("cod_nat_rec") or item.get("natureza_receita") or "").strip() or None
 
-    # ── Alíquotas: lidas do JSON para uso EXCLUSIVO pelo motor tributário ──────
-    # Não são mais gravadas em produtos_monofasicos (v3.8).
-    # São repassadas via _preparar_payload_motor() para as tabelas do motor.
     def _aliq(campo_sped, campo_alt, fallback):
         v = _parse_aliq(item.get(campo_sped)) or _parse_aliq(item.get(campo_alt))
         if v is not None:
@@ -1521,7 +1450,6 @@ def _mapear_item_monofasico(item: dict, group_label: str, filename: str):
     vig_fim    = nd(str(item.get("vigencia_fim") or "").strip())
     regime_trib = "aliquota_zero" if cst_raw == "06" else "monofasico"
 
-    # ── Payload para produtos_monofasicos (cadastro base — sem alíquotas) ──────
     payload_base = {
         "ncm":                 ncm,
         "descricao":           descricao,
@@ -1544,9 +1472,8 @@ def _mapear_item_monofasico(item: dict, group_label: str, filename: str):
         "updated_at":          now(),
     }
 
-    # ── Payload estendido para o motor tributário (inclui alíquotas e regime) ──
-    # Armazenado em _motor_extra para uso por _preparar_payload_motor().
-    # NÃO é enviado para produtos_monofasicos.
+    # ── _motor_extra: alíquotas e regime para uso EXCLUSIVO pelo motor ────────
+    # Nunca gravado em produtos_monofasicos — removido por _filtrar_payload_mono
     payload_base["_motor_extra"] = {
         "aliq_pis_simples":      0,
         "aliq_cofins_simples":   0,
@@ -1568,11 +1495,8 @@ def _mapear_item_monofasico(item: dict, group_label: str, filename: str):
 # =============================================================================
 # MOTOR TRIBUTÁRIO — espelho paralelo em produtos_tributacao_concentrada
 #                    e produtos_aliquota_zero (v3.7)
-# A tabela produtos_monofasicos permanece intacta e é gravada normalmente.
-# Estas funções apenas duplicam os dados nas novas tabelas do motor.
 # =============================================================================
 
-# Campos aceitos por cada tabela do motor tributário
 _SCHEMA_TRIB_CONC = {
     "ncm", "descricao", "segmento", "cst_pis", "cst_cofins",
     "descricao_cst", "natureza_receita", "regime_tributario",
@@ -1601,7 +1525,6 @@ _SCHEMA_ALIQ_ZERO = {
     "fonte_arquivo", "metodo_extracao", "updated_at",
 }
 
-# Segmentos válidos como enum no banco — qualquer outro vira 'Não identificado'
 _SEGMENTOS_VALIDOS = frozenset({
     "Combustíveis", "Medicamentos", "Perfumaria e Higiene", "Veículos",
     "Bebidas Alcoólicas", "Produtos Alimentícios", "Saúde",
@@ -1610,7 +1533,6 @@ _SEGMENTOS_VALIDOS = frozenset({
     "Cigarros e Tabaco", "Rações Pet", "Eletrônicos", "Não identificado",
 })
 
-# Inferência de grupo_legal a partir do nome do arquivo JSON de origem
 _GRUPO_LEGAL_POR_ARQUIVO = {
     "cesta_basica":    "cesta_basica",
     "cesta básica":    "cesta_basica",
@@ -1628,7 +1550,6 @@ _GRUPO_LEGAL_POR_ARQUIVO = {
 
 
 def _inferir_grupo_legal(fonte_arquivo: str) -> str | None:
-    """Infere grupo_legal a partir do nome do arquivo JSON de origem."""
     if not fonte_arquivo:
         return None
     fl = fonte_arquivo.lower()
@@ -1639,12 +1560,6 @@ def _inferir_grupo_legal(fonte_arquivo: str) -> str | None:
 
 
 def _preparar_payload_motor(registro: dict, tabela: str) -> dict | None:
-    """
-    Adapta o payload do pipeline para o schema das tabelas do motor tributário.
-    As alíquotas e regime_tributario vêm de registro['_motor_extra']
-    (campo interno preenchido por _mapear_item_monofasico, nunca gravado
-    em produtos_monofasicos).
-    """
     ncm = registro.get("ncm")
     if not ncm:
         return None
@@ -1656,7 +1571,6 @@ def _preparar_payload_motor(registro: dict, tabela: str) -> dict | None:
     if tabela == "produtos_aliquota_zero" and cst != "06":
         return None
 
-    # Lê alíquotas e regime do campo interno _motor_extra
     extra = registro.get("_motor_extra") or {}
     aliq_pis_pres  = extra.get("aliq_pis_presumido")
     aliq_cof_pres  = extra.get("aliq_cofins_presumido")
@@ -1725,13 +1639,6 @@ def _preparar_payload_motor(registro: dict, tabela: str) -> dict | None:
 
 
 def _upsert_motor_tributario(registros: list, origem: str = "") -> dict:
-    """
-    Recebe a lista de registros já gravados em produtos_monofasicos e
-    os espelha nas tabelas do motor tributário conforme o CST de cada um.
-
-    Retorna contadores por tabela e lista de erros.
-    Falhas aqui NÃO interrompem o pipeline principal.
-    """
     if not supabase or not registros:
         return {"trib_conc": 0, "aliq_zero": 0, "erros": []}
 
@@ -1748,12 +1655,10 @@ def _upsert_motor_tributario(registros: list, origem: str = "") -> dict:
             p = _preparar_payload_motor(reg, "produtos_aliquota_zero")
             if p:
                 lote_cst06.append(p)
-        # outros CSTs (01, 02, etc.): não entram nas tabelas do motor
 
     resultado = {"trib_conc": 0, "aliq_zero": 0, "erros": []}
     BATCH = 500
 
-    # Upsert em produtos_tributacao_concentrada
     for i in range(0, len(lote_cst04), BATCH):
         lote = lote_cst04[i:i + BATCH]
         try:
@@ -1772,7 +1677,6 @@ def _upsert_motor_tributario(registros: list, origem: str = "") -> dict:
             resultado["erros"].append(msg)
             log.error(f"[motor] {origem} upsert produtos_tributacao_concentrada: {e}")
 
-    # Upsert em produtos_aliquota_zero
     for i in range(0, len(lote_cst06), BATCH):
         lote = lote_cst06[i:i + BATCH]
         try:
@@ -1891,24 +1795,32 @@ async def _run_upsert_monofasicos(folder_id: str):
 
         registros = dedup(registros)
         log.info(f"[mono] '{filename}': {len(registros)} registro(s) após dedup")
-        registros = [_filtrar_payload_mono(r) for r in registros]
+
+        # ── v3.9: NÃO filtra aqui — preserva _motor_extra para o motor ───────
+        # O filtro é aplicado por lote apenas no momento do upsert em
+        # produtos_monofasicos, garantindo que _upsert_motor_tributario
+        # receba o lote original com _motor_extra intacto.
 
         BATCH = 500
         for i in range(0, len(registros), BATCH):
             lote = registros[i:i + BATCH]
+
+            # Filtra APENAS para o upsert em produtos_monofasicos
+            lote_mono = [_filtrar_payload_mono(r) for r in lote]
+
             try:
                 resp = (
                     supabase.table("produtos_monofasicos")
-                    .upsert(lote, on_conflict="ncm")
+                    .upsert(lote_mono, on_conflict="ncm")
                     .execute()
                 )
-                n_ok = len(resp.data) if resp.data else len(lote)
+                n_ok = len(resp.data) if resp.data else len(lote_mono)
                 total_inseridos += n_ok
                 log.info(
                     f"[mono] '{filename}' lote {i//BATCH + 1}: "
                     f"{n_ok} registro(s) upserted em produtos_monofasicos"
                 )
-                # ── v3.7: espelho nas tabelas do motor tributário ─────────────
+                # Motor recebe lote original (com _motor_extra intacto)
                 _upsert_motor_tributario(lote, origem=f"'{filename}' lote {i//BATCH + 1}")
             except Exception as e:
                 log.error(
