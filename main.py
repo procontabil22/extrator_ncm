@@ -1,8 +1,67 @@
 """
-Microserviço de Extração Fiscal v3.5
+Microserviço de Extração Fiscal v3.8
 =====================================
 Três camadas: Determinístico → Regex → Semântico (LLM)
 Mapeado para a estrutura REAL das tabelas no Supabase.
+
+v3.8 — produtos_monofasicos como cadastro base puro (2026-03-21):
+        • DECISÃO ARQUITETURAL: produtos_monofasicos é cadastro base de NCMs.
+          Alíquotas e regime_tributario pertencem às tabelas do motor tributário
+          (produtos_tributacao_concentrada e produtos_aliquota_zero).
+        • _SCHEMA_MONO: removidos aliq_pis_simples, aliq_cofins_simples,
+          aliq_pis_presumido, aliq_cofins_presumido, aliq_pis_real,
+          aliq_cofins_real e regime_tributario.
+        • mk_mono(): removidos todos os campos de alíquota e regime.
+          A função agora retorna apenas os campos do cadastro base.
+        • _mapear_item_monofasico(): idem — sem alíquotas nem regime.
+          Os campos de alíquota continuam sendo lidos do JSON e repassados
+          para _upsert_motor_tributario() via _preparar_payload_motor(),
+          mas NÃO são mais enviados para produtos_monofasicos.
+        • _filtrar_payload_mono(): garante que nenhum campo excluído
+          escoe para o upsert em produtos_monofasicos.
+        • Nenhuma outra lógica alterada.
+        • O espelho nas tabelas do motor tributário (v3.7) continua intacto.
+
+v3.7 — Espelho paralelo nas novas tabelas do motor tributário (2026-03-20):
+        • produtos_monofasicos: INTACTA — pipeline e banco inalterados.
+        • NOVO: _rotear_registro_motor() — roteia cada registro para a tabela
+          correta do motor tributário com base no cst_pis:
+            cst_pis='04' → produtos_tributacao_concentrada
+            cst_pis='06' → produtos_aliquota_zero
+            outros CSTs  → ignorado (não entra nas tabelas do motor)
+        • NOVO: _preparar_payload_motor() — adapta o payload do pipeline
+          para o schema das novas tabelas (aliquota_por_pauta derivada de
+          aliq_pis_presumido IS NULL, grupo_legal inferido do fonte_arquivo).
+        • NOVO: _upsert_motor_tributario() — persiste em lote nas novas
+          tabelas em paralelo ao upsert em produtos_monofasicos.
+        • _run_upsert_monofasicos(): mantém upsert em produtos_monofasicos
+          inalterado + chama _upsert_motor_tributario() após cada lote.
+        • salvar(): mantém upsert em produtos_monofasicos inalterado
+          + chama _upsert_motor_tributario() para os registros monofásicos.
+        • Nenhuma outra lógica alterada.
+
+v3.6 — Correções pipeline produtos_monofasicos (2026-03-20):
+        • BUG 1 CORRIGIDO — descricao sempre "Sem descrição":
+          _mapear_item_monofasico buscava chave "description" (inglês).
+          Agora tenta "descricao" | "description" | "produto" | "mercadoria".
+        • BUG 2 CORRIGIDO — base_legal e lei sempre null:
+          Buscava só "legal_basis". Agora tenta "base_legal" | "legal_basis" |
+          "fundamento_legal" | "fundamentacao" com fallback seguro.
+        • BUG 3 CORRIGIDO — alíquotas presumido/real null em vez dos defaults:
+          _mapear_item_monofasico não aplicava fallback quando os campos
+          al_pis_maj_percent etc. estavam ausentes no JSON.
+          Agora aplica fallback: pis_presumido=0.65, cofins_presumido=3.0,
+          pis_real=1.65, cofins_real=7.6 (Simples Nacional permanece 0).
+          NCMs com "var." (bebidas por pauta) continuam null — correto.
+        • BUG 4 CORRIGIDO — cst_pis/cst_cofins não respeitavam CST 01 e 06:
+          Campos cst_mono_04, cst e cst_pis agora todos tentados em ordem.
+          CST 06 (alíquota zero) e CST 01 (tributável básico) preservados.
+        • _segmento_por_grupo expandido: "cesta", "aeronave", "embarcação",
+          "saúde", "farmacê", "cosmétic", "embalagem" adicionados.
+        • mk_mono atualizado: aliq_pis_presumido=0.65, aliq_cofins_presumido=3.0
+          (estava incorreto: 0.65 e 3.0 já eram corretos, mas CST_DESC["06"]
+          não existia — adicionado).
+        • CST_DESC expandido com CST "02" e "06".
 
 v3.5 — Correção trigger normas_legais_versoes (2026-03-19):
         • normas_legais usa INSERT puro em vez de upsert
@@ -106,7 +165,7 @@ try:
     HAS_GDRIVE = True
 except: HAS_GDRIVE = False
 
-app = FastAPI(title="Extrator Fiscal v3.5", version="3.5.0")
+app = FastAPI(title="Extrator Fiscal v3.8", version="3.8.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -144,7 +203,7 @@ RE_NAT       = re.compile(r'\b([12]\d{2})\b')
 
 CST_DESC = {
     "01":  "Tributável alíquota básica",
-    "02":  "Tributável alíquota diferenciada",
+    "02":  "Monofásico — fabricante alíquota majorada",
     "04":  "Monofásico — revenda alíquota zero",
     "06":  "Alíquota zero",
     "07":  "Isento",
@@ -152,6 +211,112 @@ CST_DESC = {
     "060": "ICMS-ST cobrado anteriormente",
     "500": "CSOSN — ST cobrado anteriormente",
 }
+
+# =============================================================================
+# LOOKUP DE FUNDAMENTAÇÃO JURÍDICA POR NCM
+# Carregado do arquivo fundamentacao_lookup.json presente na mesma pasta
+# do microserviço (ou em FUNDAMENTACAO_LOOKUP_PATH no ambiente).
+# Usado por _preparar_payload_motor() para enriquecer o campo
+# fundamentacao_resumida nas tabelas do motor tributário.
+# =============================================================================
+
+# =============================================================================
+# LOOKUP DE FUNDAMENTAÇÃO JURÍDICA POR NCM
+# Carregado do Google Drive na inicialização do serviço.
+# O arquivo fundamentacao_lookup.json deve estar na mesma pasta apontada
+# por DRIVE_FOLDER_ID_MONO (mesma pasta dos demais JSONs monofásicos).
+# Fallback: arquivo local para desenvolvimento/testes.
+# =============================================================================
+
+def _carregar_lookup_drive() -> dict:
+    """
+    Baixa fundamentacao_lookup.json do Google Drive e retorna o dicionário
+    {ncm: texto_fundamentacao}. Chamado uma vez na inicialização.
+    """
+    if not HAS_GDRIVE:
+        return {}
+
+    folder_id = DRIVE_FOLDER_ID_MONO or DRIVE_FOLDER_ID_JSONS
+    if not folder_id:
+        log.warning("[motor] DRIVE_FOLDER_ID_MONO não configurado — lookup não carregado do Drive")
+        return {}
+
+    try:
+        svc = _svc()
+        if not svc:
+            return {}
+
+        # Busca o arquivo pelo nome exato na pasta
+        resultado = (
+            svc.files()
+            .list(
+                q=(
+                    f"'{folder_id}' in parents "
+                    f"and name = 'fundamentacao_lookup.json' "
+                    f"and mimeType = 'application/json' "
+                    f"and trashed = false"
+                ),
+                fields="files(id, name)",
+                pageSize=1,
+            )
+            .execute()
+            .get("files", [])
+        )
+
+        if not resultado:
+            log.warning("[motor] fundamentacao_lookup.json não encontrado no Drive")
+            return {}
+
+        file_id = resultado[0]["id"]
+        buf = io.BytesIO()
+        dl  = MediaIoBaseDownload(buf, svc.files().get_media(fileId=file_id))
+        done = False
+        while not done:
+            _, done = dl.next_chunk()
+
+        dados  = json.loads(buf.getvalue().decode("utf-8"))
+        lookup = dados.get("fundamentacao_por_ncm", {})
+        log.info(f"[motor] fundamentacao_lookup carregado do Drive: {len(lookup)} NCMs")
+        return lookup
+
+    except Exception as e:
+        log.warning(f"[motor] Falha ao carregar fundamentacao_lookup do Drive: {e}")
+        return {}
+
+
+def _carregar_lookup_fundamentacao() -> dict:
+    """
+    Carrega o lookup de fundamentação jurídica na seguinte ordem de prioridade:
+      1. Google Drive (pasta DRIVE_FOLDER_ID_MONO) — produção
+      2. Arquivo local (desenvolvimento/testes)
+    """
+    # Tenta Drive primeiro
+    lookup = _carregar_lookup_drive()
+    if lookup:
+        return lookup
+
+    # Fallback: arquivo local
+    caminhos = [
+        os.getenv("FUNDAMENTACAO_LOOKUP_PATH", ""),
+        os.path.join(os.path.dirname(__file__), "fundamentacao_lookup.json"),
+        "fundamentacao_lookup.json",
+    ]
+    for caminho in caminhos:
+        if caminho and os.path.isfile(caminho):
+            try:
+                with open(caminho, encoding="utf-8") as f:
+                    dados = json.load(f)
+                lookup = dados.get("fundamentacao_por_ncm", {})
+                log.info(f"[motor] fundamentacao_lookup carregado localmente: {len(lookup)} NCMs de '{caminho}'")
+                return lookup
+            except Exception as e:
+                log.warning(f"[motor] Falha ao carregar fundamentacao_lookup local '{caminho}': {e}")
+
+    log.warning("[motor] fundamentacao_lookup não encontrado — campo fundamentacao_resumida ficará NULL")
+    return {}
+
+
+_FUNDAMENTACAO_LOOKUP: dict = _carregar_lookup_fundamentacao()
 
 PADROES_MONO = [
     r"monof[aá]sico", r"pis[/\s]+cofins", r"lei\s+10\.147",
@@ -182,17 +347,25 @@ SEGMENTOS = {
 
 _GENERATED_COLS_MONO: frozenset = frozenset({})
 
+# Campos que foram removidos da produtos_monofasicos em v3.8
+# Garantia extra: mesmo que entrem no payload, são filtrados aqui
+_REMOVED_COLS_MONO: frozenset = frozenset({
+    "aliq_pis_simples", "aliq_cofins_simples",
+    "aliq_pis_presumido", "aliq_cofins_presumido",
+    "aliq_pis_real", "aliq_cofins_real",
+    "regime_tributario",
+    "_motor_extra",  # campo interno — nunca vai para o banco
+})
+
 
 def _filtrar_payload_mono(registro: dict) -> dict:
-    if not _GENERATED_COLS_MONO:
-        return registro
-    filtrado = {}
-    for k, v in registro.items():
-        if k in _GENERATED_COLS_MONO:
-            log.warning(f"[mono] coluna '{k}' removida do payload (listada em _GENERATED_COLS_MONO como GENERATED)")
-        else:
-            filtrado[k] = v
-    return filtrado
+    """
+    Filtra o payload antes do upsert em produtos_monofasicos.
+    Remove campos gerados pelo banco, campos excluídos em v3.8
+    e o campo interno _motor_extra.
+    """
+    excluir = _GENERATED_COLS_MONO | _REMOVED_COLS_MONO
+    return {k: v for k, v in registro.items() if k not in excluir}
 
 
 def limpar_ncm(r):
@@ -238,30 +411,33 @@ def now():
 
 def mk_mono(ncm, descricao, segmento, cst_pis, natureza, base_legal, lei,
             vigencia_inicio, vigencia_fim, fonte, metodo):
+    """
+    Monta o payload para produtos_monofasicos (cadastro base puro).
+    Não inclui alíquotas nem regime_tributario — esses campos foram
+    movidos para as tabelas do motor tributário (v3.8).
+    """
     cst = cst_pis or "04"
     vig_ini = vigencia_inicio or "1998-01-01"
     return {
-        "ncm":                   ncm,
-        "descricao":             descricao,
-        "base_legal":            base_legal,
-        "lei":                   lei,
-        "vigencia_inicio":       vig_ini,
-        "vigencia_fim":          vigencia_fim,
-        "ativo":                 vigencia_fim is None,
-        "cst_pis":               cst,
-        "cst_cofins":            cst,
-        "natureza_receita":      natureza,
-        "aliq_pis_presumido":    0.65,
-        "aliq_cofins_presumido": 3.0,
-        "aliq_pis_real":         1.65,
-        "aliq_cofins_real":      7.6,
-        "aliq_pis_simples":      0,
-        "aliq_cofins_simples":   0,
-        "segmento":              segmento,
-        "descricao_cst":         CST_DESC.get(cst),
-        "fonte_arquivo":         fonte,
-        "metodo_extracao":       metodo,
-        "updated_at":            now(),
+        "ncm":              ncm,
+        "descricao":        descricao,
+        "segmento":         segmento,
+        "cst_pis":          cst,
+        "cst_cofins":       cst,
+        "descricao_cst":    CST_DESC.get(cst),
+        "natureza_receita": natureza,
+        "base_legal":       base_legal,
+        "lei":              lei,
+        "norma_legal_id":   None,
+        "normas_relacionadas": None,
+        "vigencia_inicio":  vig_ini,
+        "vigencia_fim":     vigencia_fim,
+        "ativo":            vigencia_fim is None,
+        "content":          None,
+        "metadata":         None,
+        "fonte_arquivo":    fonte,
+        "metodo_extracao":  metodo,
+        "updated_at":       now(),
     }
 
 def mk_st(ncm, cest, descricao, segmento, cst, csosn,
@@ -474,6 +650,10 @@ def salvar(mono, st):
         try:
             supabase.table("produtos_monofasicos").upsert(mono_filtrado, on_conflict="ncm").execute()
             r["mono"] = len(mono_filtrado)
+            # ── v3.7: espelho nas tabelas do motor tributário ─────────────────
+            motor = _upsert_motor_tributario(mono_filtrado, origem="extrair-ncms")
+            if motor["erros"]:
+                r["erros"].extend(motor["erros"])
         except Exception as e: r["erros"].append(f"mono:{str(e)[:200]}"); log.error(e)
     if st:
         try: supabase.table("produtos_icms_st").upsert(st, on_conflict="ncm").execute(); r["st"] = len(st)
@@ -578,20 +758,27 @@ def _svc():
 @app.get("/health")
 def health():
     return {
-        "status": "ok", "versao": "3.5.0",
+        "status": "ok", "versao": "3.8.0",
         "supabase": supabase is not None,
         "pdf": HAS_PDF, "xlsx": HAS_XLSX, "docx": HAS_DOCX, "gdrive": HAS_GDRIVE,
-        "generated_cols_mono": sorted(_GENERATED_COLS_MONO),
+        "removed_cols_mono": sorted(_REMOVED_COLS_MONO - {"_motor_extra"}),
     }
 
 @app.get("/status")
 def status_db():
     if not supabase: return {"erro": "Supabase não configurado"}
     try:
-        m = supabase.table("produtos_monofasicos").select("ncm", count="exact").execute()
-        s = supabase.table("produtos_icms_st").select("ncm", count="exact").execute()
-        return {"produtos_monofasicos": m.count, "produtos_icms_st": s.count,
-                "timestamp": datetime.utcnow().isoformat()}
+        m  = supabase.table("produtos_monofasicos").select("ncm", count="exact").execute()
+        s  = supabase.table("produtos_icms_st").select("ncm", count="exact").execute()
+        tc = supabase.table("produtos_tributacao_concentrada").select("ncm", count="exact").execute()
+        az = supabase.table("produtos_aliquota_zero").select("ncm", count="exact").execute()
+        return {
+            "produtos_monofasicos":             m.count,
+            "produtos_icms_st":                 s.count,
+            "produtos_tributacao_concentrada":  tc.count,
+            "produtos_aliquota_zero":           az.count,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
     except Exception as e: return {"erro": str(e)}
 
 @app.post("/extrair-ncms")
@@ -1161,28 +1348,83 @@ async def _run_upsert_icms_jsons(folder_id: str):
 # =============================================================================
 
 _SCHEMA_MONO = {
-    "ncm", "descricao", "base_legal", "lei", "vigencia_inicio", "vigencia_fim",
-    "ativo", "norma_legal_id", "normas_relacionadas", "content", "metadata",
-    "cst_pis", "cst_cofins", "natureza_receita", "aliq_pis_simples",
-    "aliq_cofins_simples", "aliq_pis_presumido", "aliq_cofins_presumido",
-    "aliq_pis_real", "aliq_cofins_real", "segmento", "descricao_cst",
-    "regime_tributario", "fonte_arquivo", "metodo_extracao", "updated_at",
+    # Identificação do NCM
+    "ncm", "descricao", "segmento",
+    # Classificação tributária (sem alíquotas — estão nas tabelas do motor)
+    "cst_pis", "cst_cofins", "descricao_cst", "natureza_receita",
+    # Base legal
+    "base_legal", "lei", "norma_legal_id", "normas_relacionadas",
+    # Vigência
+    "vigencia_inicio", "vigencia_fim", "ativo",
+    # Semântico
+    "content", "metadata",
+    # Rastreabilidade
+    "fonte_arquivo", "metodo_extracao", "updated_at",
 }
 
 _SEGMENTO_GRUPO: list = [
-    ("combustív",          "Combustíveis"),
-    ("derivados de petról","Combustíveis"),
-    ("farmacê",            "Medicamentos"),
-    ("farmaci",            "Medicamentos"),
-    ("higiene",            "Perfumaria e Higiene"),
-    ("cosmétic",           "Perfumaria e Higiene"),
-    ("veículos",           "Veículos"),
-    ("automotor",          "Veículos"),
-    ("bebida",             "Bebidas Alcoólicas"),
-    ("embalagem",          "Bebidas Alcoólicas"),
-    ("máquina",            "Materiais de Construção"),
-    ("equipament",         "Materiais de Construção"),
-    ("construção",         "Materiais de Construção"),
+    # Combustíveis
+    ("combustív",           "Combustíveis"),
+    ("derivados de petról", "Combustíveis"),
+    ("petróleo",            "Combustíveis"),
+    ("biodiesel",           "Combustíveis"),
+    ("energia elétr",       "Combustíveis"),
+    # Medicamentos / Farmácia
+    ("farmacê",             "Medicamentos"),
+    ("farmaci",             "Medicamentos"),
+    ("fármacos",            "Medicamentos"),
+    ("medicament",          "Medicamentos"),
+    ("produtos farmac",     "Medicamentos"),
+    # Perfumaria e Higiene
+    ("higiene",             "Perfumaria e Higiene"),
+    ("cosmétic",            "Perfumaria e Higiene"),
+    ("perfumaria",          "Perfumaria e Higiene"),
+    ("cosméticos",          "Perfumaria e Higiene"),
+    # Veículos
+    ("veículos automotor",  "Veículos"),
+    ("automotor",           "Veículos"),
+    ("veículos",            "Veículos"),
+    ("motocicleta",         "Veículos"),
+    # Bebidas
+    ("bebida",              "Bebidas Alcoólicas"),
+    ("cerveja",             "Bebidas Alcoólicas"),
+    ("vinho",               "Bebidas Alcoólicas"),
+    ("suco",                "Bebidas Alcoólicas"),
+    ("bebidas frias",       "Bebidas Alcoólicas"),
+    # Embalagens para bebidas
+    ("embalagem",           "Bebidas Alcoólicas"),
+    # Máquinas / Equipamentos / Construção
+    ("máquina",             "Materiais de Construção"),
+    ("equipament",          "Materiais de Construção"),
+    ("construção",          "Materiais de Construção"),
+    ("agrícola",            "Materiais de Construção"),
+    ("hortícola",           "Materiais de Construção"),
+    # Produtos Alimentícios / Cesta Básica
+    ("cesta básica",        "Produtos Alimentícios"),
+    ("aliment",             "Produtos Alimentícios"),
+    ("laticín",             "Produtos Alimentícios"),
+    ("farinha",             "Produtos Alimentícios"),
+    ("carne",               "Produtos Alimentícios"),
+    ("leite",               "Produtos Alimentícios"),
+    ("açúcar",              "Produtos Alimentícios"),
+    ("arroz",               "Produtos Alimentícios"),
+    ("trigo",               "Produtos Alimentícios"),
+    ("óleo",                "Produtos Alimentícios"),
+    # Saúde / Ortopédicos
+    ("saúde",               "Saúde"),
+    ("ortopéd",             "Saúde"),
+    ("prótese",             "Saúde"),
+    ("cadeira de roda",     "Saúde"),
+    ("portadores de defici","Saúde"),
+    ("audição",             "Saúde"),
+    ("lentes",              "Saúde"),
+    # Aeronaves / Embarcações
+    ("aeronave",            "Aeronaves e Embarcações"),
+    ("helicóptero",         "Aeronaves e Embarcações"),
+    ("avião",               "Aeronaves e Embarcações"),
+    ("embarcação",          "Aeronaves e Embarcações"),
+    ("navio",               "Aeronaves e Embarcações"),
+    ("barco",               "Aeronaves e Embarcações"),
 ]
 
 
@@ -1210,52 +1452,352 @@ def _mapear_item_monofasico(item: dict, group_label: str, filename: str):
         log.warning(f"[mono] {filename}: NCM inválido '{ncm_raw}' — item ignorado")
         return None
 
-    descricao    = str(item.get("description") or "").strip() or "Sem descrição"
-    cst_raw      = str(item.get("cst_mono_04") or "04").strip()
-    legal_basis  = str(item.get("legal_basis") or "").strip() or None
-    cod_nat      = str(item.get("cod_nat_rec") or "").strip() or None
+    # Descrição — tenta todas as variações de nome do campo
+    descricao = (
+        str(item.get("descricao") or
+            item.get("description") or
+            item.get("produto") or
+            item.get("mercadoria") or "").strip()
+        or "Sem descrição"
+    )
 
-    aliq_pis_pres  = _parse_aliq(item.get("al_pis_maj_percent"))
-    aliq_cof_pres  = _parse_aliq(item.get("al_cof_maj_percent"))
-    aliq_pis_real  = _parse_aliq(item.get("al_pis_norm_percent"))
-    aliq_cof_real  = _parse_aliq(item.get("al_cof_norm_percent"))
+    # CST — tenta todas as variações de nome do campo
+    cst_raw = str(
+        item.get("cst_pis") or
+        item.get("cst_mono_04") or
+        item.get("cst") or
+        item.get("cst_cofins") or
+        "04"
+    ).strip()
+    if cst_raw.isdigit() and len(cst_raw) > 2 and int(cst_raw) < 100:
+        cst_raw = str(int(cst_raw)).zfill(2)
+
+    # Base legal — tenta todas as variações de nome do campo
+    legal_basis = (
+        str(item.get("base_legal") or
+            item.get("legal_basis") or
+            item.get("fundamento_legal") or
+            item.get("fundamentacao") or "").strip()
+        or None
+    )
+
+    cod_nat = str(item.get("cod_nat_rec") or item.get("natureza_receita") or "").strip() or None
+
+    # ── Alíquotas: lidas do JSON para uso EXCLUSIVO pelo motor tributário ──────
+    # Não são mais gravadas em produtos_monofasicos (v3.8).
+    # São repassadas via _preparar_payload_motor() para as tabelas do motor.
+    def _aliq(campo_sped, campo_alt, fallback):
+        v = _parse_aliq(item.get(campo_sped)) or _parse_aliq(item.get(campo_alt))
+        if v is not None:
+            return v
+        raw = str(item.get(campo_sped) or item.get(campo_alt) or "").strip()
+        if raw.lower() in ("var.", "var", "–", "-", ""):
+            return None
+        return fallback
+
+    if cst_raw == "06":
+        aliq_pis_pres  = 0.0
+        aliq_cof_pres  = 0.0
+        aliq_pis_real  = 0.0
+        aliq_cof_real  = 0.0
+    elif cst_raw == "01":
+        aliq_pis_pres  = _aliq("al_pis_maj_percent",  "aliq_pis_presumido",  0.65)
+        aliq_cof_pres  = _aliq("al_cof_maj_percent",  "aliq_cofins_presumido", 3.0)
+        aliq_pis_real  = _aliq("al_pis_norm_percent", "aliq_pis_real",        1.65)
+        aliq_cof_real  = _aliq("al_cof_norm_percent", "aliq_cofins_real",     7.6)
+    else:
+        aliq_pis_pres  = _aliq("al_pis_maj_percent",  "aliq_pis_presumido",  0.65)
+        aliq_cof_pres  = _aliq("al_cof_maj_percent",  "aliq_cofins_presumido", 3.0)
+        aliq_pis_real  = _aliq("al_pis_norm_percent", "aliq_pis_real",        1.65)
+        aliq_cof_real  = _aliq("al_cof_norm_percent", "aliq_cofins_real",     7.6)
 
     lei = None
     if legal_basis:
         lei_match = RE_LEI.search(legal_basis)
         lei = "Lei " + lei_match.group(1) if lei_match else None
 
-    segmento = _segmento_por_grupo(group_label)
+    segmento   = _segmento_por_grupo(group_label)
     vig_inicio = nd(str(item.get("vigencia_inicio") or "").strip()) or "1998-01-01"
+    vig_fim    = nd(str(item.get("vigencia_fim") or "").strip())
+    regime_trib = "aliquota_zero" if cst_raw == "06" else "monofasico"
 
-    return {
-        "ncm":                   ncm,
-        "descricao":             descricao,
-        "base_legal":            legal_basis,
-        "lei":                   lei,
-        "vigencia_inicio":       vig_inicio,
-        "vigencia_fim":          nd(str(item.get("vigencia_fim") or "").strip()),
-        "ativo":                 nd(str(item.get("vigencia_fim") or "").strip()) is None,
-        "norma_legal_id":        None,
-        "normas_relacionadas":   None,
-        "content":               None,
-        "metadata":              None,
-        "cst_pis":               cst_raw,
-        "cst_cofins":            cst_raw,
-        "natureza_receita":      cod_nat,
+    # ── Payload para produtos_monofasicos (cadastro base — sem alíquotas) ──────
+    payload_base = {
+        "ncm":                 ncm,
+        "descricao":           descricao,
+        "segmento":            segmento,
+        "cst_pis":             cst_raw,
+        "cst_cofins":          cst_raw,
+        "descricao_cst":       CST_DESC.get(cst_raw),
+        "natureza_receita":    cod_nat,
+        "base_legal":          legal_basis,
+        "lei":                 lei,
+        "norma_legal_id":      None,
+        "normas_relacionadas": None,
+        "vigencia_inicio":     vig_inicio,
+        "vigencia_fim":        vig_fim,
+        "ativo":               vig_fim is None,
+        "content":             None,
+        "metadata":            None,
+        "fonte_arquivo":       filename,
+        "metodo_extracao":     "json_estruturado",
+        "updated_at":          now(),
+    }
+
+    # ── Payload estendido para o motor tributário (inclui alíquotas e regime) ──
+    # Armazenado em _motor_extra para uso por _preparar_payload_motor().
+    # NÃO é enviado para produtos_monofasicos.
+    payload_base["_motor_extra"] = {
         "aliq_pis_simples":      0,
         "aliq_cofins_simples":   0,
         "aliq_pis_presumido":    aliq_pis_pres,
         "aliq_cofins_presumido": aliq_cof_pres,
         "aliq_pis_real":         aliq_pis_real,
         "aliq_cofins_real":      aliq_cof_real,
-        "segmento":              segmento,
-        "descricao_cst":         CST_DESC.get(cst_raw),
-        "regime_tributario":     "monofasico",
-        "fonte_arquivo":         filename,
-        "metodo_extracao":       "json_estruturado",
-        "updated_at":            now(),
+        "regime_tributario":     regime_trib,
+        "fundamentacao_resumida": (
+            item.get("fundamentacao_resumida") or
+            _FUNDAMENTACAO_LOOKUP.get(ncm) or
+            _FUNDAMENTACAO_LOOKUP.get(ncm[:4])
+        ),
     }
+
+    return payload_base
+
+
+# =============================================================================
+# MOTOR TRIBUTÁRIO — espelho paralelo em produtos_tributacao_concentrada
+#                    e produtos_aliquota_zero (v3.7)
+# A tabela produtos_monofasicos permanece intacta e é gravada normalmente.
+# Estas funções apenas duplicam os dados nas novas tabelas do motor.
+# =============================================================================
+
+# Campos aceitos por cada tabela do motor tributário
+_SCHEMA_TRIB_CONC = {
+    "ncm", "descricao", "segmento", "cst_pis", "cst_cofins",
+    "descricao_cst", "natureza_receita", "regime_tributario",
+    "aliq_pis_simples", "aliq_cofins_simples",
+    "aliq_pis_presumido", "aliq_cofins_presumido",
+    "aliq_pis_real", "aliq_cofins_real",
+    "aliquota_por_pauta",
+    "base_legal", "lei", "fundamentacao_resumida",
+    "norma_legal_id", "normas_relacionadas",
+    "vigencia_inicio", "vigencia_fim", "ativo",
+    "content", "metadata",
+    "fonte_arquivo", "metodo_extracao", "updated_at",
+}
+
+_SCHEMA_ALIQ_ZERO = {
+    "ncm", "descricao", "segmento", "cst_pis", "cst_cofins",
+    "descricao_cst", "regime_tributario", "natureza_receita",
+    "grupo_legal",
+    "aliq_pis_simples", "aliq_cofins_simples",
+    "aliq_pis_presumido", "aliq_cofins_presumido",
+    "aliq_pis_real", "aliq_cofins_real",
+    "base_legal", "lei", "fundamentacao_resumida",
+    "norma_legal_id", "normas_relacionadas",
+    "vigencia_inicio", "vigencia_fim", "ativo",
+    "content", "metadata",
+    "fonte_arquivo", "metodo_extracao", "updated_at",
+}
+
+# Segmentos válidos como enum no banco — qualquer outro vira 'Não identificado'
+_SEGMENTOS_VALIDOS = frozenset({
+    "Combustíveis", "Medicamentos", "Perfumaria e Higiene", "Veículos",
+    "Bebidas Alcoólicas", "Produtos Alimentícios", "Saúde",
+    "Aeronaves e Embarcações", "Materiais de Construção",
+    "Materiais de Limpeza", "Pneumáticos", "Tintas e Vernizes",
+    "Cigarros e Tabaco", "Rações Pet", "Eletrônicos", "Não identificado",
+})
+
+# Inferência de grupo_legal a partir do nome do arquivo JSON de origem
+_GRUPO_LEGAL_POR_ARQUIVO = {
+    "cesta_basica":    "cesta_basica",
+    "cesta básica":    "cesta_basica",
+    "leite":           "leite_derivados",
+    "aeronave":        "aeronaves",
+    "embarcacao":      "embarcacoes",
+    "embarcação":      "embarcacoes",
+    "saude":           "saude",
+    "saúde":           "saude",
+    "ortopedico":      "ortopedicos",
+    "ortopédico":      "ortopedicos",
+    "deficiente":      "deficientes",
+    "suplemento":      "suplementos",
+}
+
+
+def _inferir_grupo_legal(fonte_arquivo: str) -> str | None:
+    """Infere grupo_legal a partir do nome do arquivo JSON de origem."""
+    if not fonte_arquivo:
+        return None
+    fl = fonte_arquivo.lower()
+    for fragmento, grupo in _GRUPO_LEGAL_POR_ARQUIVO.items():
+        if fragmento in fl:
+            return grupo
+    return None
+
+
+def _preparar_payload_motor(registro: dict, tabela: str) -> dict | None:
+    """
+    Adapta o payload do pipeline para o schema das tabelas do motor tributário.
+    As alíquotas e regime_tributario vêm de registro['_motor_extra']
+    (campo interno preenchido por _mapear_item_monofasico, nunca gravado
+    em produtos_monofasicos).
+    """
+    ncm = registro.get("ncm")
+    if not ncm:
+        return None
+
+    cst = str(registro.get("cst_pis") or "").strip()
+
+    if tabela == "produtos_tributacao_concentrada" and cst != "04":
+        return None
+    if tabela == "produtos_aliquota_zero" and cst != "06":
+        return None
+
+    # Lê alíquotas e regime do campo interno _motor_extra
+    extra = registro.get("_motor_extra") or {}
+    aliq_pis_pres  = extra.get("aliq_pis_presumido")
+    aliq_cof_pres  = extra.get("aliq_cofins_presumido")
+    aliq_pis_real  = extra.get("aliq_pis_real")
+    aliq_cof_real  = extra.get("aliq_cofins_real")
+    regime_trib    = extra.get("regime_tributario", "monofasico")
+    fund_resumida  = extra.get("fundamentacao_resumida") or _FUNDAMENTACAO_LOOKUP.get(ncm) or _FUNDAMENTACAO_LOOKUP.get(ncm[:4])
+
+    segmento = registro.get("segmento") or "Não identificado"
+    if segmento not in _SEGMENTOS_VALIDOS:
+        segmento = "Não identificado"
+
+    payload = {
+        "ncm":                   ncm,
+        "descricao":             registro.get("descricao") or "Sem descrição",
+        "segmento":              segmento,
+        "cst_pis":               cst,
+        "cst_cofins":            str(registro.get("cst_cofins") or cst).strip(),
+        "descricao_cst":         registro.get("descricao_cst"),
+        "natureza_receita":      registro.get("natureza_receita"),
+        "regime_tributario":     regime_trib,
+        "aliq_pis_simples":      extra.get("aliq_pis_simples", 0),
+        "aliq_cofins_simples":   extra.get("aliq_cofins_simples", 0),
+        "aliq_pis_presumido":    aliq_pis_pres,
+        "aliq_cofins_presumido": aliq_cof_pres,
+        "aliq_pis_real":         aliq_pis_real,
+        "aliq_cofins_real":      aliq_cof_real,
+        "base_legal":            registro.get("base_legal"),
+        "lei":                   registro.get("lei"),
+        "fundamentacao_resumida": fund_resumida,
+        "norma_legal_id":        registro.get("norma_legal_id"),
+        "normas_relacionadas":   registro.get("normas_relacionadas"),
+        "vigencia_inicio":       registro.get("vigencia_inicio") or "1998-01-01",
+        "vigencia_fim":          registro.get("vigencia_fim"),
+        "ativo":                 registro.get("ativo", True),
+        "content":               registro.get("content"),
+        "metadata":              registro.get("metadata"),
+        "fonte_arquivo":         registro.get("fonte_arquivo"),
+        "metodo_extracao":       registro.get("metodo_extracao") or "json_estruturado",
+        "updated_at":            registro.get("updated_at") or now(),
+    }
+
+    if tabela == "produtos_tributacao_concentrada":
+        aliquota_por_pauta = (
+            payload["aliq_pis_presumido"] is None and
+            payload["aliq_cofins_presumido"] is None
+        )
+        payload["aliquota_por_pauta"] = aliquota_por_pauta
+        if aliquota_por_pauta:
+            payload["aliq_pis_presumido"]    = None
+            payload["aliq_cofins_presumido"] = None
+        return {k: v for k, v in payload.items() if k in _SCHEMA_TRIB_CONC}
+
+    if tabela == "produtos_aliquota_zero":
+        payload["aliq_pis_presumido"]    = 0
+        payload["aliq_cofins_presumido"] = 0
+        payload["aliq_pis_real"]         = 0
+        payload["aliq_cofins_real"]      = 0
+        payload["grupo_legal"] = (
+            registro.get("grupo_legal") or
+            _inferir_grupo_legal(registro.get("fonte_arquivo") or "")
+        )
+        return {k: v for k, v in payload.items() if k in _SCHEMA_ALIQ_ZERO}
+
+    return None
+
+
+def _upsert_motor_tributario(registros: list, origem: str = "") -> dict:
+    """
+    Recebe a lista de registros já gravados em produtos_monofasicos e
+    os espelha nas tabelas do motor tributário conforme o CST de cada um.
+
+    Retorna contadores por tabela e lista de erros.
+    Falhas aqui NÃO interrompem o pipeline principal.
+    """
+    if not supabase or not registros:
+        return {"trib_conc": 0, "aliq_zero": 0, "erros": []}
+
+    lote_cst04: list = []
+    lote_cst06: list = []
+
+    for reg in registros:
+        cst = str(reg.get("cst_pis") or "").strip()
+        if cst == "04":
+            p = _preparar_payload_motor(reg, "produtos_tributacao_concentrada")
+            if p:
+                lote_cst04.append(p)
+        elif cst == "06":
+            p = _preparar_payload_motor(reg, "produtos_aliquota_zero")
+            if p:
+                lote_cst06.append(p)
+        # outros CSTs (01, 02, etc.): não entram nas tabelas do motor
+
+    resultado = {"trib_conc": 0, "aliq_zero": 0, "erros": []}
+    BATCH = 500
+
+    # Upsert em produtos_tributacao_concentrada
+    for i in range(0, len(lote_cst04), BATCH):
+        lote = lote_cst04[i:i + BATCH]
+        try:
+            resp = (
+                supabase.table("produtos_tributacao_concentrada")
+                .upsert(lote, on_conflict="ncm")
+                .execute()
+            )
+            resultado["trib_conc"] += len(resp.data) if resp.data else len(lote)
+            log.info(
+                f"[motor] {origem} lote {i//BATCH + 1}: "
+                f"{len(lote)} registro(s) → produtos_tributacao_concentrada"
+            )
+        except Exception as e:
+            msg = f"motor:cst04:{str(e)[:200]}"
+            resultado["erros"].append(msg)
+            log.error(f"[motor] {origem} upsert produtos_tributacao_concentrada: {e}")
+
+    # Upsert em produtos_aliquota_zero
+    for i in range(0, len(lote_cst06), BATCH):
+        lote = lote_cst06[i:i + BATCH]
+        try:
+            resp = (
+                supabase.table("produtos_aliquota_zero")
+                .upsert(lote, on_conflict="ncm")
+                .execute()
+            )
+            resultado["aliq_zero"] += len(resp.data) if resp.data else len(lote)
+            log.info(
+                f"[motor] {origem} lote {i//BATCH + 1}: "
+                f"{len(lote)} registro(s) → produtos_aliquota_zero"
+            )
+        except Exception as e:
+            msg = f"motor:cst06:{str(e)[:200]}"
+            resultado["erros"].append(msg)
+            log.error(f"[motor] {origem} upsert produtos_aliquota_zero: {e}")
+
+    log.info(
+        f"[motor] {origem} ✓ "
+        f"trib_conc={resultado['trib_conc']} | "
+        f"aliq_zero={resultado['aliq_zero']} | "
+        f"erros={len(resultado['erros'])}"
+    )
+    return resultado
 
 
 def _extrair_registros_mono(data: dict, filename: str) -> list:
@@ -1366,6 +1908,8 @@ async def _run_upsert_monofasicos(folder_id: str):
                     f"[mono] '{filename}' lote {i//BATCH + 1}: "
                     f"{n_ok} registro(s) upserted em produtos_monofasicos"
                 )
+                # ── v3.7: espelho nas tabelas do motor tributário ─────────────
+                _upsert_motor_tributario(lote, origem=f"'{filename}' lote {i//BATCH + 1}")
             except Exception as e:
                 log.error(
                     f"[mono] '{filename}' lote {i//BATCH + 1}: "
