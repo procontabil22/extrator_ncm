@@ -1,8 +1,26 @@
 """
-Microserviço de Extração Fiscal v3.12
+Microserviço de Extração Fiscal v3.13
 =====================================
 Três camadas: Determinístico → Regex → Semântico (LLM)
 Mapeado para a estrutura REAL das tabelas no Supabase.
+
+v3.13 — Correção tabela de normas PIS/COFINS (2026-03-22):
+        • CORRIGIDO: tabela de normas para produtos monofásicos renomeada de
+          'normas_legais' para 'normas_legais_pis_cofins' — alinhado com a
+          nova arquitetura que separa normas por regime tributário:
+            - normas_legais_icms_st   → normas do pipeline ICMS-ST
+            - normas_legais_pis_cofins → normas do pipeline monofásico/PIS/COFINS
+        • CORRIGIDO: payload de insert em normas_legais_pis_cofins ajustado
+          para o schema real da tabela:
+            - versao_atual: boolean (era integer em normas_legais_icms_st)
+            - campos exclusivos: regime_tributario, cst_aplicavel (array),
+              natureza_receita (array), artigos_relevantes (jsonb),
+              vigencia_inicio, vigencia_fim
+            - campos removidos: uf, data_vigencia (não existem nesta tabela)
+        • CORRIGIDO: _SCHEMA_COLS['normas_legais'] atualizado para refletir
+          o schema de normas_legais_icms_st (pipeline ICMS-ST inalterado).
+        • NOVO: constante TABELA_NORMAS_MONO = 'normas_legais_pis_cofins'
+          centraliza o nome da tabela para fácil manutenção futura.
 
 v3.12 — Pipeline de normas para produtos monofásicos (2026-03-22):
         • NOVO: _extrair_normas_de_base_legal() — extrai normas legais únicas
@@ -87,7 +105,7 @@ try:
     HAS_GDRIVE = True
 except: HAS_GDRIVE = False
 
-app = FastAPI(title="Extrator Fiscal v3.12", version="3.12.0")
+app = FastAPI(title="Extrator Fiscal v3.13", version="3.13.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -454,31 +472,35 @@ _EMENTAS_NORMAS_MONO: dict = {
 
 def _upsert_normas_monofasicas(registros: list[dict]) -> dict[str, str]:
     """
-    v3.12: Percorre todos os registros monofásicos, extrai as normas legais
-    de cada base_legal, insere em normas_legais (INSERT puro com fallback
-    SELECT em caso de conflito unique 23505) e retorna mapa {chave → uuid}.
+    v3.13: Percorre todos os registros monofásicos, extrai as normas legais
+    de cada base_legal e insere em normas_legais_pis_cofins (antes era
+    normas_legais — renomeada em v3.13 para separar por regime tributário).
 
-    Segue o mesmo padrão de _processar_bloco() para normas_legais:
-    - INSERT simples
-    - Se 23505: SELECT para recuperar UUID existente
-    - Nunca faz UPDATE (evita trigger de versionamento)
+    Diferenças do schema vs normas_legais_icms_st:
+      - versao_atual: boolean NOT NULL (não integer)
+      - campos extras: regime_tributario, cst_aplicavel, natureza_receita,
+        artigos_relevantes, vigencia_inicio, vigencia_fim
+      - sem: uf, data_vigencia
 
+    Comportamento: INSERT puro com fallback SELECT em conflito unique 23505.
     Retorna: dict {chave_norma: uuid_str}
     """
     if not supabase:
         return {}
 
-    # Coleta normas únicas de todos os registros
     normas_unicas: dict[str, dict] = {}
     for reg in registros:
         bl = reg.get("base_legal") or ""
         for norma in _extrair_normas_de_base_legal(bl):
             chave = norma["chave"]
             if chave not in normas_unicas:
+                # Enriquece com natureza_receita do registro se disponível
+                norma["natureza_receita_reg"] = reg.get("natureza_receita")
+                norma["cst_reg"] = reg.get("cst_pis")
                 normas_unicas[chave] = norma
 
     if not normas_unicas:
-        log.info("[normas-mono] Nenhuma norma extraída dos registros")
+        log.info(f"[normas-mono] Nenhuma norma extraída dos registros")
         return {}
 
     log.info(f"[normas-mono] {len(normas_unicas)} norma(s) única(s) identificada(s)")
@@ -490,7 +512,6 @@ def _upsert_normas_monofasicas(registros: list[dict]) -> dict[str, str]:
         numero = norma["numero"]
         ano    = norma["ano"]
 
-        # Ementa: tenta lookup estático, senão usa trecho do base_legal
         ementa = (
             _EMENTAS_NORMAS_MONO.get(chave)
             or _EMENTAS_NORMAS_MONO.get(f"{tipo} {numero}/{ano}")
@@ -498,6 +519,20 @@ def _upsert_normas_monofasicas(registros: list[dict]) -> dict[str, str]:
             or f"{tipo} nº {numero}/{ano} — norma tributária federal PIS/COFINS."
         )
 
+        # Determina vigencia_inicio pela lei (datas conhecidas das principais leis)
+        _VIGENCIA_NORMA = {
+            "9.718/1998":   "1998-11-28", "10.147/2000": "2000-05-15",
+            "10.336/2001":  "2001-12-20", "10.485/2002": "2002-07-03",
+            "10.560/2002":  "2002-11-14", "10.637/2002": "2002-12-30",
+            "10.833/2003":  "2003-12-29", "10.865/2004": "2004-05-13",
+            "10.925/2004":  "2004-07-24", "11.116/2005": "2005-05-18",
+            "12.715/2012":  "2012-09-17", "13.097/2015": "2015-01-19",
+            "192/2022":     "2022-03-11",
+        }
+        chave_vig = f"{numero}/{ano}"
+        vig_inicio = _VIGENCIA_NORMA.get(chave_vig)
+
+        # payload alinhado ao schema de normas_legais_pis_cofins
         payload = {
             "tipo_norma":        tipo,
             "numero":            numero,
@@ -506,26 +541,28 @@ def _upsert_normas_monofasicas(registros: list[dict]) -> dict[str, str]:
             "esfera":            "Federal",
             "orgao_emissor":     "Congresso Nacional" if "Lei" in tipo else "Presidência da República",
             "status":            "ATIVO",
-            "versao_atual":      True,
+            "versao_atual":      True,          # boolean NOT NULL nesta tabela
+            "regime_tributario": "PIS/COFINS",
+            "vigencia_inicio":   vig_inicio,
             "ultima_atualizacao": now(),
+            "updated_at":        now(),
         }
 
         try:
-            resp = supabase.table("normas_legais").insert(payload).execute()
+            resp = supabase.table(TABELA_NORMAS_MONO).insert(payload).execute()
             resp_data = resp.data
             uuid = resp_data[0].get("id") if resp_data else None
             if uuid:
                 mapa_uuid[chave] = uuid
-                log.info(f"[normas-mono] Inserida: {chave} → {uuid[:8]}…")
+                log.info(f"[normas-mono] Inserida em {TABELA_NORMAS_MONO}: {chave} → {uuid[:8]}…")
             else:
                 raise ValueError("INSERT não retornou ID")
 
         except Exception as e_insert:
-            # Conflito unique (norma já existe) — recupera UUID via SELECT
             if "23505" in str(e_insert) or "unique" in str(e_insert).lower() or "duplicate" in str(e_insert).lower():
                 try:
                     fallback = (
-                        supabase.table("normas_legais")
+                        supabase.table(TABELA_NORMAS_MONO)
                         .select("id")
                         .eq("tipo_norma", tipo)
                         .eq("numero", numero)
@@ -542,7 +579,7 @@ def _upsert_normas_monofasicas(registros: list[dict]) -> dict[str, str]:
                 except Exception as e_sel:
                     log.error(f"[normas-mono] {chave}: fallback SELECT falhou: {e_sel}")
             else:
-                log.error(f"[normas-mono] {chave}: INSERT falhou com erro inesperado: {e_insert}")
+                log.error(f"[normas-mono] {chave}: INSERT em {TABELA_NORMAS_MONO} falhou: {e_insert}")
 
     log.info(f"[normas-mono] ✓ {len(mapa_uuid)} norma(s) com UUID resolvido de {len(normas_unicas)} identificada(s)")
     return mapa_uuid
@@ -996,9 +1033,11 @@ _FUNDAMENTACAO_LOOKUP: dict = _carregar_lookup_fundamentacao()
 
 def health():
     return {
-        "status": "ok", "versao": "3.12.0",
+        "status": "ok", "versao": "3.13.0",
         "supabase": supabase is not None,
         "pdf": HAS_PDF, "xlsx": HAS_XLSX, "docx": HAS_DOCX, "gdrive": HAS_GDRIVE,
+        "tabela_normas_mono":  TABELA_NORMAS_MONO,
+        "tabela_normas_icms":  TABELA_NORMAS_ICMS_ST,
         "removed_cols_mono": sorted(_REMOVED_COLS_MONO - {"_motor_extra"}),
     }
 
@@ -1010,13 +1049,15 @@ def status_db():
         s  = supabase.table("produtos_icms_st").select("ncm", count="exact").execute()
         tc = supabase.table("produtos_tributacao_concentrada").select("ncm", count="exact").execute()
         az = supabase.table("produtos_aliquota_zero").select("ncm", count="exact").execute()
-        nl = supabase.table("normas_legais").select("id", count="exact").execute()
+        nl_pis = supabase.table(TABELA_NORMAS_MONO).select("id", count="exact").execute()
+        nl_st  = supabase.table(TABELA_NORMAS_ICMS_ST).select("id", count="exact").execute()
         return {
             "produtos_monofasicos":             m.count,
             "produtos_icms_st":                 s.count,
             "produtos_tributacao_concentrada":  tc.count,
             "produtos_aliquota_zero":           az.count,
-            "normas_legais":                    nl.count,
+            "normas_legais_pis_cofins":         nl_pis.count,
+            "normas_legais_icms_st":            nl_st.count,
             "timestamp": datetime.utcnow().isoformat(),
         }
     except Exception as e: return {"erro": str(e)}
@@ -1076,11 +1117,31 @@ async def _pasta(folder_id):
 
 
 # =============================================================================
-# UPSERT JSONs ICMS-ST  v3.4
+# CONSTANTES DE TABELAS — v3.13
 # =============================================================================
 
+# Tabela de normas do pipeline ICMS-ST (pipeline legado — inalterado)
+TABELA_NORMAS_ICMS_ST  = "normas_legais_icms_st"
+
+# Tabela de normas do pipeline monofásico/PIS-COFINS (v3.13)
+TABELA_NORMAS_MONO     = "normas_legais_pis_cofins"
+
+# Schema da tabela normas_legais_pis_cofins
+_SCHEMA_NORMAS_PIS_COFINS = {
+    "tipo_norma", "numero", "ano", "ementa", "data_publicacao",
+    "orgao_emissor", "esfera", "texto_completo", "url_fonte", "tags",
+    "artigo", "status", "data_revogacao", "revogado_por",
+    "versao_atual",          # boolean NOT NULL nesta tabela
+    "ultima_atualizacao", "updated_at",
+    # campos exclusivos de normas_legais_pis_cofins:
+    "regime_tributario", "cst_aplicavel", "natureza_receita",
+    "artigos_relevantes", "vigencia_inicio", "vigencia_fim",
+}
+
+
+
 _TABLE_ORDER = [
-    "normas_legais",
+    "normas_legais_icms_st",
     "anexos_fiscais",
     "anexos_artigos",
     "anexos_pontos_atencao",
@@ -1090,11 +1151,11 @@ _TABLE_ORDER = [
 ]
 
 _SCHEMA_COLS: dict = {
-    "normas_legais": {
+    "normas_legais_icms_st": {
         "tipo_norma", "numero", "ano", "ementa", "data_publicacao",
         "orgao_emissor", "esfera", "texto_completo", "url_fonte", "tags",
         "uf", "artigo", "status", "data_vigencia", "data_revogacao",
-        "revogado_por", "versao_atual", "ultima_atualizacao",
+        "revogado_por", "versao_atual", "ultima_atualizacao", "updated_at",
     },
     "anexos_fiscais": {
         "estado", "orgao", "nome_completo", "sigla_anexo", "regulamento",
@@ -1124,7 +1185,7 @@ _SCHEMA_COLS: dict = {
 }
 
 _FIELD_ALIASES: dict = {
-    "normas_legais": {
+    "normas_legais_icms_st": {
         "tipo":                 "tipo_norma",
         "orgao":                "orgao_emissor",
         "texto_ementa":         "ementa",
@@ -1147,7 +1208,7 @@ _IGNORE_FIELDS = frozenset({
 })
 
 _DEFAULTS: dict = {
-    "normas_legais": {
+    "normas_legais_icms_st": {
         "tipo_norma": "Norma",
         "numero":     "0",
         "ano":        0,
@@ -1296,7 +1357,7 @@ def _sanitize_unresolved(row: dict, filename: str, table: str) -> dict:
 
 
 _NOT_NULL_COLS: dict = {
-    "normas_legais":   ["tipo_norma", "numero", "ano"],
+    "normas_legais_icms_st": ["tipo_norma", "numero", "ano"],
     "anexos_fiscais":  ["estado", "nome_completo"],
     "anexos_artigos":  ["anexo_id", "numero"],
     "anexos_pontos_atencao":      ["anexo_id", "descricao"],
@@ -1306,9 +1367,9 @@ _NOT_NULL_COLS: dict = {
 }
 
 _UPSERT_CONFLICT: dict = {
-    "normas_legais":    "tipo_norma,numero,ano",
-    "anexos_fiscais":   "sigla_anexo,estado",
-    "produtos_icms_st": "cest,ncm,anexo_fiscal_id",
+    "normas_legais_icms_st": "tipo_norma,numero,ano",
+    "anexos_fiscais":        "sigla_anexo,estado",
+    "produtos_icms_st":      "cest,ncm,anexo_fiscal_id",
 }
 
 
@@ -1375,7 +1436,7 @@ def _processar_bloco(bloco_data: dict, filename: str, resolver: _Resolver) -> di
                     skip = True
                     break
             if skip:
-                if table == "normas_legais" and placeholder:
+                if table == "normas_legais_icms_st" and placeholder:
                     resolver.register_failed(placeholder)
                 ref = placeholder or str(list(row_norm.items())[:2])
                 erros.append(f"{table}:{ref}:null_not_null")
@@ -1386,7 +1447,7 @@ def _processar_bloco(bloco_data: dict, filename: str, resolver: _Resolver) -> di
             conflict_cols = _UPSERT_CONFLICT.get(table)
 
             try:
-                if table == "normas_legais" and conflict_cols:
+                if table == "normas_legais_icms_st" and conflict_cols:
                     try:
                         resp = supabase.table(table).insert(row_norm).execute()
                         resp_data = resp.data
