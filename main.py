@@ -1,62 +1,33 @@
 """
-Microserviço de Extração Fiscal v3.10
+Microserviço de Extração Fiscal v3.11
 =====================================
 Três camadas: Determinístico → Regex → Semântico (LLM)
 Mapeado para a estrutura REAL das tabelas no Supabase.
 
+v3.11 — Correção UnboundLocalError total_inseridos (2026-03-22):
+        • BUG CORRIGIDO — UnboundLocalError: cannot access local variable
+          'total_inseridos' where it is not associated with a value.
+        • Causa: ao inserir o bloco ARQUIVOS_IGNORAR no v3.10,
+          a declaração 'total_inseridos = 0' foi removida acidentalmente
+          enquanto 'total_erros = 0' permaneceu.
+        • Correção: restaurada a declaração 'total_inseridos = 0'
+          logo após o filtro de arquivos auxiliares.
+
 v3.10 — Correções pós-deploy (2026-03-22):
         • BUG 1 CORRIGIDO — name '_svc' is not defined na inicialização:
-          _FUNDAMENTACAO_LOOKUP era inicializado no topo do módulo, antes
-          de _svc() ser definida. Movido para depois de _svc().
+          _FUNDAMENTACAO_LOOKUP movido para depois de _svc().
         • BUG 2 CORRIGIDO — fundamentacao_lookup.json sendo processado
-          como JSON monofásico: _run_upsert_monofasicos agora filtra
-          arquivos cujo nome é 'fundamentacao_lookup.json' antes de
-          tentar extrair registros.
-        • Nenhuma outra lógica alterada.
+          como JSON monofásico: filtro ARQUIVOS_IGNORAR adicionado.
 
-v3.9 — Correção _run_upsert_monofasicos: preserva _motor_extra para o motor (2026-03-21):
-        • BUG CORRIGIDO — _filtrar_payload_mono era aplicado sobre o lote
-          ANTES de chamar _upsert_motor_tributario, removendo _motor_extra
-          e deixando o motor tributário sem as alíquotas necessárias.
-        • CORREÇÃO: lote original (com _motor_extra) vai para
-          _upsert_motor_tributario; lote_mono (filtrado) vai para
-          produtos_monofasicos. Duas variáveis distintas por iteração.
-
-v3.8 — produtos_monofasicos como cadastro base puro (2026-03-21):
-        • DECISÃO ARQUITETURAL: produtos_monofasicos é cadastro base de NCMs.
-          Alíquotas e regime_tributario pertencem às tabelas do motor tributário
-          (produtos_tributacao_concentrada e produtos_aliquota_zero).
-        • _SCHEMA_MONO: removidos aliq_pis_simples, aliq_cofins_simples,
-          aliq_pis_presumido, aliq_cofins_presumido, aliq_pis_real,
-          aliq_cofins_real e regime_tributario.
-        • mk_mono(): removidos todos os campos de alíquota e regime.
-        • _mapear_item_monofasico(): idem — sem alíquotas nem regime.
-        • _filtrar_payload_mono(): garante que nenhum campo excluído
-          escoe para o upsert em produtos_monofasicos.
-
-v3.7 — Espelho paralelo nas novas tabelas do motor tributário (2026-03-20):
-        • produtos_monofasicos: INTACTA — pipeline e banco inalterados.
-        • NOVO: _rotear_registro_motor() — roteia cada registro para a tabela
-          correta do motor tributário com base no cst_pis:
-            cst_pis='04' → produtos_tributacao_concentrada
-            cst_pis='06' → produtos_aliquota_zero
-            outros CSTs  → ignorado (não entra nas tabelas do motor)
-        • NOVO: _preparar_payload_motor() — adapta o payload do pipeline
-          para o schema das novas tabelas.
-        • NOVO: _upsert_motor_tributario() — persiste em lote nas novas
-          tabelas em paralelo ao upsert em produtos_monofasicos.
-
-v3.6 — Correções pipeline produtos_monofasicos (2026-03-20):
-        • BUG 1 CORRIGIDO — descricao sempre "Sem descrição"
-        • BUG 2 CORRIGIDO — base_legal e lei sempre null
-        • BUG 3 CORRIGIDO — alíquotas presumido/real null
-        • BUG 4 CORRIGIDO — cst_pis/cst_cofins não respeitavam CST 01 e 06
-
-v3.5 — Correção trigger normas_legais_versoes (2026-03-19)
-v3.4 — Correções de persistência relacional (2026-03-19)
-v3.3 — Correção vigencia_inicio NOT NULL / aliq_cofins_presumido
-v3.1 — Correção aliq_pis_simples / aliq_cofins_simples
-v3.0 — Pipeline independente para produtos_monofasicos via JSON
+v3.9 — Correção _run_upsert_monofasicos: preserva _motor_extra (2026-03-21).
+v3.8 — produtos_monofasicos como cadastro base puro (2026-03-21).
+v3.7 — Espelho paralelo nas novas tabelas do motor tributário (2026-03-20).
+v3.6 — Correções pipeline produtos_monofasicos (2026-03-20).
+v3.5 — Correção trigger normas_legais_versoes (2026-03-19).
+v3.4 — Correções de persistência relacional (2026-03-19).
+v3.3 — Correção vigencia_inicio NOT NULL / aliq_cofins_presumido.
+v3.1 — Correção aliq_pis_simples / aliq_cofins_simples.
+v3.0 — Pipeline independente para produtos_monofasicos via JSON.
 """
 
 import os, re, io, json, base64, logging
@@ -106,7 +77,7 @@ try:
     HAS_GDRIVE = True
 except: HAS_GDRIVE = False
 
-app = FastAPI(title="Extrator Fiscal v3.10", version="3.10.0")
+app = FastAPI(title="Extrator Fiscal v3.11", version="3.11.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -701,7 +672,7 @@ def _svc():
 _FUNDAMENTACAO_LOOKUP: dict = _carregar_lookup_fundamentacao()
 def health():
     return {
-        "status": "ok", "versao": "3.10.0",
+        "status": "ok", "versao": "3.11.0",
         "supabase": supabase is not None,
         "pdf": HAS_PDF, "xlsx": HAS_XLSX, "docx": HAS_DOCX, "gdrive": HAS_GDRIVE,
         "removed_cols_mono": sorted(_REMOVED_COLS_MONO - {"_motor_extra"}),
@@ -1811,6 +1782,8 @@ async def _run_upsert_monofasicos(folder_id: str):
     ARQUIVOS_IGNORAR = {"fundamentacao_lookup.json"}
     files = [f for f in files if f["name"] not in ARQUIVOS_IGNORAR]
     log.info(f"[mono] {len(files)} arquivo(s) JSON após filtro de auxiliares")
+
+    total_inseridos = 0
     total_erros     = 0
 
     for file_meta in files:
