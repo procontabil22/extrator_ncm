@@ -1,33 +1,45 @@
 """
-Microserviço de Extração Fiscal v3.11
+Microserviço de Extração Fiscal v3.12
 =====================================
 Três camadas: Determinístico → Regex → Semântico (LLM)
 Mapeado para a estrutura REAL das tabelas no Supabase.
 
-v3.11 — Correção UnboundLocalError total_inseridos (2026-03-22):
-        • BUG CORRIGIDO — UnboundLocalError: cannot access local variable
-          'total_inseridos' where it is not associated with a value.
-        • Causa: ao inserir o bloco ARQUIVOS_IGNORAR no v3.10,
-          a declaração 'total_inseridos = 0' foi removida acidentalmente
-          enquanto 'total_erros = 0' permaneceu.
-        • Correção: restaurada a declaração 'total_inseridos = 0'
-          logo após o filtro de arquivos auxiliares.
+v3.12 — Pipeline de normas para produtos monofásicos (2026-03-22):
+        • NOVO: _extrair_normas_de_base_legal() — extrai normas legais únicas
+          do campo base_legal de cada registro monofásico usando regex ampliado
+          que cobre todos os formatos reais encontrados nos JSONs:
+            - "Lei 10.147/2000, art. 1º, I"
+            - "Art. 4º, I, Lei 9.718/98"
+            - "LC 192/2022; MP 1.157/2023"
+            - "Decreto 8.395/2015"
+            - "Art. 58-I, Lei 10.833/03 c/c art. 76, Lei 12.715/2012"
+        • NOVO: _upsert_normas_monofasicas() — insere/recupera UUIDs das
+          normas em normas_legais e retorna mapa {chave → uuid}.
+          Comportamento: INSERT puro; se 23505 (unique), recupera UUID via
+          SELECT (mesmo padrão do pipeline ICMS-ST para normas_legais).
+        • NOVO: _vincular_normas_em_registros() — percorre os registros
+          monofásicos já gravados e preenche norma_legal_id (primeira norma)
+          e normas_relacionadas (array com todos os UUIDs vinculados ao NCM)
+          via UPDATE em produtos_monofasicos, produtos_tributacao_concentrada
+          e produtos_aliquota_zero.
+        • CORRIGIDO: RE_LEI ampliado para capturar "Lei X/AAAA" precedida de
+          artigo ("Art. Xº, I, Lei ..."), "LC NNN/AAAA" e anos de 2 dígitos
+          ("/98", "/00", "/02", etc.) convertidos para 4 dígitos.
+        • CORRIGIDO: campo `lei` agora é extraído corretamente em
+          _mapear_item_monofasico() e _mapear_linha_xlsx() para todos os
+          formatos acima.
 
-v3.10 — Correções pós-deploy (2026-03-22):
-        • BUG 1 CORRIGIDO — name '_svc' is not defined na inicialização:
-          _FUNDAMENTACAO_LOOKUP movido para depois de _svc().
-        • BUG 2 CORRIGIDO — fundamentacao_lookup.json sendo processado
-          como JSON monofásico: filtro ARQUIVOS_IGNORAR adicionado.
-
-v3.9 — Correção _run_upsert_monofasicos: preserva _motor_extra (2026-03-21).
-v3.8 — produtos_monofasicos como cadastro base puro (2026-03-21).
-v3.7 — Espelho paralelo nas novas tabelas do motor tributário (2026-03-20).
-v3.6 — Correções pipeline produtos_monofasicos (2026-03-20).
-v3.5 — Correção trigger normas_legais_versoes (2026-03-19).
-v3.4 — Correções de persistência relacional (2026-03-19).
-v3.3 — Correção vigencia_inicio NOT NULL / aliq_cofins_presumido.
-v3.1 — Correção aliq_pis_simples / aliq_cofins_simples.
-v3.0 — Pipeline independente para produtos_monofasicos via JSON.
+v3.11 — Correção UnboundLocalError total_inseridos (2026-03-22).
+v3.10 — Correções pós-deploy (2026-03-22).
+v3.9  — Correção _run_upsert_monofasicos: preserva _motor_extra (2026-03-21).
+v3.8  — produtos_monofasicos como cadastro base puro (2026-03-21).
+v3.7  — Espelho paralelo nas novas tabelas do motor tributário (2026-03-20).
+v3.6  — Correções pipeline produtos_monofasicos (2026-03-20).
+v3.5  — Correção trigger normas_legais_versoes (2026-03-19).
+v3.4  — Correções de persistência relacional (2026-03-19).
+v3.3  — Correção vigencia_inicio NOT NULL / aliq_cofins_presumido.
+v3.1  — Correção aliq_pis_simples / aliq_cofins_simples.
+v3.0  — Pipeline independente para produtos_monofasicos via JSON.
 """
 
 import os, re, io, json, base64, logging
@@ -62,8 +74,6 @@ try:    import openpyxl;                           HAS_XLSX    = True
 except: HAS_XLSX    = False
 try:    import pandas as pd;                       HAS_PANDAS  = True
 except: HAS_PANDAS  = False
-try:    import pandas as pd;                       HAS_PANDAS  = True
-except: HAS_PANDAS  = False
 try:    from docx import Document as Docx;         HAS_DOCX    = True
 except: HAS_DOCX    = False
 try:    from supabase import create_client;        HAS_SB      = True
@@ -77,7 +87,7 @@ try:
     HAS_GDRIVE = True
 except: HAS_GDRIVE = False
 
-app = FastAPI(title="Extrator Fiscal v3.11", version="3.11.0")
+app = FastAPI(title="Extrator Fiscal v3.12", version="3.12.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -102,6 +112,36 @@ class ExtrairRequest(BaseModel):
     forcar_regime: Optional[str] = None
 
 
+# =============================================================================
+# REGEX — v3.12: ampliado para cobrir todos os formatos reais dos JSONs
+# =============================================================================
+
+# Captura "Lei 9.718/98", "Lei 10.147/2000", "Art. 4º, I, Lei 9.718/98"
+# e também anos de 2 dígitos (/98, /00, /02) convertidos para 4 dígitos
+RE_LEI_MONO = re.compile(
+    r'Lei\s+(?:Complementar\s+)?(?:n[oº°]?\s*)?'
+    r'([\d][\d\.]*)'
+    r'[/\-]'
+    r'(\d{2,4})',
+    re.I
+)
+# Captura "LC 192/2022"
+RE_LC_MONO = re.compile(
+    r'\bLC\s+([\d]+)[/\-](\d{2,4})',
+    re.I
+)
+# Captura "MP 1.157/2023"
+RE_MP_MONO = re.compile(
+    r'\bMP\s+([\d][\d\.]*)[/\-](\d{2,4})',
+    re.I
+)
+# Captura "Decreto 8.395/2015", "Decreto nº 5.059/2004"
+RE_DEC_MONO = re.compile(
+    r'Decreto\s+(?:n[oº°]?\s*)?([\d][\d\.]*)[/\-](\d{2,4})',
+    re.I
+)
+
+# Regex legados (mantidos para compatibilidade com outros pipelines)
 RE_NCM       = re.compile(r'\b(\d{4}[\.\ -]?\d{0,2}[\.\ -]?\d{0,2}[\.\ -]?\d{0,2})\b')
 RE_CEST      = re.compile(r'\b(\d{2}\.\d{3}\.\d{2})\b')
 RE_CFOP      = re.compile(r'\b([56]\d{3})\b')
@@ -112,6 +152,25 @@ RE_PROT      = re.compile(r'[Pp]rotocolo\s+ICMS\s+(?:n[oº]?\s*)?(\d+[/\-]\d+)')
 RE_LEI       = re.compile(r'[Ll]ei\s+(?:[Cc]omplementar\s+)?(?:n[oº]?\s*)?(\d+[\.\ d]*[/\-]\d+)')
 RE_DECRETO   = re.compile(r'[Dd]ecreto\s+(?:n[oº]?\s*)?(\d+[\.\ d]*[/\-]\d+)')
 RE_NAT       = re.compile(r'\b([12]\d{2})\b')
+
+# Regex para extração de lei no campo `lei` (texto curto ex: "Lei 10.147/2000")
+RE_LEI_XLSX = re.compile(
+    r'(?:Lei\s+(?:Complementar\s+)?(?:n[oº°]?\s*)?|LC\s+)([\d][\d\.]*)[/\-](\d{2,4})',
+    re.I
+)
+
+
+def _ano4(ano_str: str) -> int:
+    """Converte ano de 2 dígitos para 4 dígitos (98 → 1998, 03 → 2003)."""
+    a = int(ano_str)
+    if a < 100:
+        return 1900 + a if a >= 88 else 2000 + a
+    return a
+
+
+def _chave_norma(tipo: str, numero: str, ano: int) -> str:
+    return f"{tipo} {numero}/{ano}"
+
 
 CST_DESC = {
     "01":  "Tributável alíquota básica",
@@ -126,39 +185,19 @@ CST_DESC = {
 
 # =============================================================================
 # LOOKUP DE FUNDAMENTAÇÃO JURÍDICA POR NCM
-# Carregado do arquivo fundamentacao_lookup.json presente na mesma pasta
-# do microserviço (ou em FUNDAMENTACAO_LOOKUP_PATH no ambiente).
-# Usado por _preparar_payload_motor() para enriquecer o campo
-# fundamentacao_resumida nas tabelas do motor tributário.
-# =============================================================================
-
-# =============================================================================
-# LOOKUP DE FUNDAMENTAÇÃO JURÍDICA POR NCM
-# Carregado do Google Drive na inicialização do serviço.
-# O arquivo fundamentacao_lookup.json deve estar na mesma pasta apontada
-# por DRIVE_FOLDER_ID_MONO (mesma pasta dos demais JSONs monofásicos).
-# Fallback: arquivo local para desenvolvimento/testes.
 # =============================================================================
 
 def _carregar_lookup_drive() -> dict:
-    """
-    Baixa fundamentacao_lookup.json do Google Drive e retorna o dicionário
-    {ncm: texto_fundamentacao}. Chamado uma vez na inicialização.
-    """
     if not HAS_GDRIVE:
         return {}
-
     folder_id = DRIVE_FOLDER_ID_MONO or DRIVE_FOLDER_ID_JSONS
     if not folder_id:
         log.warning("[motor] DRIVE_FOLDER_ID_MONO não configurado — lookup não carregado do Drive")
         return {}
-
     try:
         svc = _svc()
         if not svc:
             return {}
-
-        # Busca o arquivo pelo nome exato na pasta
         resultado = (
             svc.files()
             .list(
@@ -174,40 +213,28 @@ def _carregar_lookup_drive() -> dict:
             .execute()
             .get("files", [])
         )
-
         if not resultado:
             log.warning("[motor] fundamentacao_lookup.json não encontrado no Drive")
             return {}
-
         file_id = resultado[0]["id"]
         buf = io.BytesIO()
         dl  = MediaIoBaseDownload(buf, svc.files().get_media(fileId=file_id))
         done = False
         while not done:
             _, done = dl.next_chunk()
-
         dados  = json.loads(buf.getvalue().decode("utf-8"))
         lookup = dados.get("fundamentacao_por_ncm", {})
         log.info(f"[motor] fundamentacao_lookup carregado do Drive: {len(lookup)} NCMs")
         return lookup
-
     except Exception as e:
         log.warning(f"[motor] Falha ao carregar fundamentacao_lookup do Drive: {e}")
         return {}
 
 
 def _carregar_lookup_fundamentacao() -> dict:
-    """
-    Carrega o lookup de fundamentação jurídica na seguinte ordem de prioridade:
-      1. Google Drive (pasta DRIVE_FOLDER_ID_MONO) — produção
-      2. Arquivo local (desenvolvimento/testes)
-    """
-    # Tenta Drive primeiro
     lookup = _carregar_lookup_drive()
     if lookup:
         return lookup
-
-    # Fallback: arquivo local
     caminhos = [
         os.getenv("FUNDAMENTACAO_LOOKUP_PATH", ""),
         os.path.join(os.path.dirname(__file__), "fundamentacao_lookup.json"),
@@ -223,13 +250,9 @@ def _carregar_lookup_fundamentacao() -> dict:
                 return lookup
             except Exception as e:
                 log.warning(f"[motor] Falha ao carregar fundamentacao_lookup local '{caminho}': {e}")
-
     log.warning("[motor] fundamentacao_lookup não encontrado — campo fundamentacao_resumida ficará NULL")
     return {}
 
-
-# ATENÇÃO: _FUNDAMENTACAO_LOOKUP é inicializado APÓS _svc() ser definida.
-# Ver linha abaixo de _svc() — movido em v3.10 para evitar NameError na inicialização.
 
 PADROES_MONO = [
     r"monof[aá]sico", r"pis[/\s]+cofins", r"lei\s+10\.147",
@@ -260,23 +283,16 @@ SEGMENTOS = {
 
 _GENERATED_COLS_MONO: frozenset = frozenset({})
 
-# Campos que foram removidos da produtos_monofasicos em v3.8
-# Garantia extra: mesmo que entrem no payload, são filtrados aqui
 _REMOVED_COLS_MONO: frozenset = frozenset({
     "aliq_pis_simples", "aliq_cofins_simples",
     "aliq_pis_presumido", "aliq_cofins_presumido",
     "aliq_pis_real", "aliq_cofins_real",
     "regime_tributario",
-    "_motor_extra",  # campo interno — nunca vai para o banco
+    "_motor_extra",
 })
 
 
 def _filtrar_payload_mono(registro: dict) -> dict:
-    """
-    Filtra o payload antes do upsert em produtos_monofasicos.
-    Remove campos gerados pelo banco, campos excluídos em v3.8
-    e o campo interno _motor_extra.
-    """
     excluir = _GENERATED_COLS_MONO | _REMOVED_COLS_MONO
     return {k: v for k, v in registro.items() if k not in excluir}
 
@@ -322,15 +338,313 @@ def now():
     return datetime.utcnow().isoformat()
 
 
+# =============================================================================
+# v3.12 — EXTRAÇÃO DE NORMAS LEGAIS DO CAMPO base_legal
+# =============================================================================
+
+def _extrair_normas_de_base_legal(base_legal: str) -> list[dict]:
+    """
+    Extrai todas as normas legais referenciadas em um campo base_legal.
+    Suporta os formatos reais encontrados nos JSONs monofásicos:
+      - "Lei 10.147/2000, art. 1º, I"
+      - "Art. 4º, I, Lei 9.718/98"
+      - "LC 192/2022; MP 1.157/2023"
+      - "Decreto 8.395/2015"
+      - "Art. 58-I, Lei 10.833/03 c/c art. 76, Lei 12.715/2012"
+
+    Retorna lista de dicts com: tipo_norma, numero, ano, chave, ementa_resumida.
+    Anos de 2 dígitos são convertidos para 4 dígitos automaticamente.
+    """
+    if not base_legal:
+        return []
+
+    normas = {}
+
+    def _registrar(tipo, numero, ano_str, trecho):
+        ano = _ano4(ano_str)
+        numero = numero.strip().rstrip(".")
+        chave  = _chave_norma(tipo, numero, ano)
+        if chave not in normas:
+            normas[chave] = {
+                "tipo_norma": tipo,
+                "numero":     numero,
+                "ano":        ano,
+                "chave":      chave,
+                "ementa_resumida": trecho.strip()[:200],
+            }
+
+    for m in RE_LC_MONO.finditer(base_legal):
+        _registrar("Lei Complementar", m.group(1), m.group(2), base_legal)
+
+    for m in RE_MP_MONO.finditer(base_legal):
+        _registrar("Medida Provisória", m.group(1), m.group(2), base_legal)
+
+    for m in RE_DEC_MONO.finditer(base_legal):
+        _registrar("Decreto", m.group(1), m.group(2), base_legal)
+
+    for m in RE_LEI_MONO.finditer(base_legal):
+        numero = m.group(1)
+        ano_str = m.group(2)
+        # Evita capturar números de artigos como "Lei" (ex: "art. 1º")
+        chave_test = _chave_norma("Lei", numero, _ano4(ano_str))
+        # Não duplica com LC ou MP já registrados
+        conflito = any(
+            v["numero"] == numero and v["ano"] == _ano4(ano_str)
+            for v in normas.values()
+        )
+        if not conflito:
+            _registrar("Lei", numero, ano_str, base_legal)
+
+    return list(normas.values())
+
+
+def _lei_curta_de_base_legal(base_legal: str) -> str | None:
+    """
+    Retorna a primeira norma encontrada em formato curto para o campo `lei`.
+    Ex: "Lei 10.147/2000" ou "LC 192/2022" ou "Decreto 8.395/2015".
+    """
+    if not base_legal:
+        return None
+
+    m = RE_LC_MONO.search(base_legal)
+    if m:
+        return f"LC {m.group(1)}/{_ano4(m.group(2))}"
+
+    m = RE_LEI_MONO.search(base_legal)
+    if m:
+        return f"Lei {m.group(1)}/{_ano4(m.group(2))}"
+
+    m = RE_DEC_MONO.search(base_legal)
+    if m:
+        return f"Decreto {m.group(1)}/{_ano4(m.group(2))}"
+
+    m = RE_MP_MONO.search(base_legal)
+    if m:
+        return f"MP {m.group(1)}/{_ano4(m.group(2))}"
+
+    return None
+
+
+# =============================================================================
+# v3.12 — UPSERT DE NORMAS LEGAIS MONOFÁSICAS
+# =============================================================================
+
+# Ementas conhecidas das principais leis monofásicas
+# Usadas como fallback quando o JSON não traz ementa completa
+_EMENTAS_NORMAS_MONO: dict = {
+    "Lei 9.718/1998":        "Altera a legislação tributária federal — institui regime monofásico de PIS/COFINS para combustíveis.",
+    "Lei 10.147/2000":       "Dispõe sobre a incidência do PIS/COFINS no regime monofásico — produtos farmacêuticos, perfumaria e higiene pessoal.",
+    "Lei 10.485/2002":       "Dispõe sobre a incidência do PIS/COFINS no regime monofásico — veículos automotores, autopeças e máquinas agrícolas.",
+    "Lei 10.560/2002":       "Reduz a alíquota do PIS/COFINS incidente sobre querosene de aviação.",
+    "Lei 10.833/2003":       "Institui a COFINS não-cumulativa e o regime monofásico para bebidas frias (art. 58-I).",
+    "Lei 10.865/2004":       "Institui o PIS/COFINS-Importação e estabelece alíquota zero para aeronaves, embarcações, produtos de saúde e ortopédicos.",
+    "Lei 10.925/2004":       "Reduz a zero as alíquotas do PIS/COFINS incidentes sobre receitas da venda de produtos da cesta básica.",
+    "Lei 11.116/2005":       "Dispõe sobre o Registro Especial do Produtor de Biodiesel e sobre a incidência das contribuições PIS/COFINS.",
+    "Lei 12.715/2012":       "Altera a legislação tributária federal — inclui cervejas no regime monofásico de PIS/COFINS.",
+    "Lei 13.097/2015":       "Reduz a zero as alíquotas do PIS/COFINS na venda a varejo de bebidas frias (regime por pauta).",
+    "Lei Complementar 192/2022": "Estabelece as alíquotas do ICMS sobre combustíveis e institui alíquota zero de PIS/COFINS para GNL, GNC, GNV e GLP.",
+    "Decreto 5.059/2004":    "Regulamenta a incidência do PIS/COFINS sobre GLP — complementa LC 192/2022.",
+    "Decreto 5.171/2004":    "Regulamenta a alíquota zero de PIS/COFINS para produtos de saúde — extratos de glândulas e órgãos.",
+    "Decreto 6.573/2008":    "Regulamenta a incidência do PIS/COFINS sobre álcool etílico carburante.",
+    "Decreto 8.395/2015":    "Regulamenta a incidência do PIS/COFINS sobre combustíveis — gasolina e diesel.",
+    "Medida Provisória 1.157/2023": "Estabelece alíquota zero transitória de PIS/COFINS sobre GNL.",
+    "Medida Provisória 1.163/2023": "Prorroga alíquota zero transitória de PIS/COFINS sobre GNV.",
+}
+
+
+def _upsert_normas_monofasicas(registros: list[dict]) -> dict[str, str]:
+    """
+    v3.12: Percorre todos os registros monofásicos, extrai as normas legais
+    de cada base_legal, insere em normas_legais (INSERT puro com fallback
+    SELECT em caso de conflito unique 23505) e retorna mapa {chave → uuid}.
+
+    Segue o mesmo padrão de _processar_bloco() para normas_legais:
+    - INSERT simples
+    - Se 23505: SELECT para recuperar UUID existente
+    - Nunca faz UPDATE (evita trigger de versionamento)
+
+    Retorna: dict {chave_norma: uuid_str}
+    """
+    if not supabase:
+        return {}
+
+    # Coleta normas únicas de todos os registros
+    normas_unicas: dict[str, dict] = {}
+    for reg in registros:
+        bl = reg.get("base_legal") or ""
+        for norma in _extrair_normas_de_base_legal(bl):
+            chave = norma["chave"]
+            if chave not in normas_unicas:
+                normas_unicas[chave] = norma
+
+    if not normas_unicas:
+        log.info("[normas-mono] Nenhuma norma extraída dos registros")
+        return {}
+
+    log.info(f"[normas-mono] {len(normas_unicas)} norma(s) única(s) identificada(s)")
+
+    mapa_uuid: dict[str, str] = {}
+
+    for chave, norma in normas_unicas.items():
+        tipo   = norma["tipo_norma"]
+        numero = norma["numero"]
+        ano    = norma["ano"]
+
+        # Ementa: tenta lookup estático, senão usa trecho do base_legal
+        ementa = (
+            _EMENTAS_NORMAS_MONO.get(chave)
+            or _EMENTAS_NORMAS_MONO.get(f"{tipo} {numero}/{ano}")
+            or norma.get("ementa_resumida")
+            or f"{tipo} nº {numero}/{ano} — norma tributária federal PIS/COFINS."
+        )
+
+        payload = {
+            "tipo_norma":        tipo,
+            "numero":            numero,
+            "ano":               ano,
+            "ementa":            ementa,
+            "esfera":            "Federal",
+            "orgao_emissor":     "Congresso Nacional" if "Lei" in tipo else "Presidência da República",
+            "status":            "ATIVO",
+            "versao_atual":      True,
+            "ultima_atualizacao": now(),
+        }
+
+        try:
+            resp = supabase.table("normas_legais").insert(payload).execute()
+            resp_data = resp.data
+            uuid = resp_data[0].get("id") if resp_data else None
+            if uuid:
+                mapa_uuid[chave] = uuid
+                log.info(f"[normas-mono] Inserida: {chave} → {uuid[:8]}…")
+            else:
+                raise ValueError("INSERT não retornou ID")
+
+        except Exception as e_insert:
+            # Conflito unique (norma já existe) — recupera UUID via SELECT
+            if "23505" in str(e_insert) or "unique" in str(e_insert).lower() or "duplicate" in str(e_insert).lower():
+                try:
+                    fallback = (
+                        supabase.table("normas_legais")
+                        .select("id")
+                        .eq("tipo_norma", tipo)
+                        .eq("numero", numero)
+                        .eq("ano", ano)
+                        .limit(1)
+                        .execute()
+                    )
+                    if fallback.data:
+                        uuid = fallback.data[0].get("id")
+                        mapa_uuid[chave] = uuid
+                        log.info(f"[normas-mono] Já existe: {chave} → UUID recuperado {uuid[:8]}…")
+                    else:
+                        log.warning(f"[normas-mono] {chave}: conflito único mas SELECT não retornou — ignorado")
+                except Exception as e_sel:
+                    log.error(f"[normas-mono] {chave}: fallback SELECT falhou: {e_sel}")
+            else:
+                log.error(f"[normas-mono] {chave}: INSERT falhou com erro inesperado: {e_insert}")
+
+    log.info(f"[normas-mono] ✓ {len(mapa_uuid)} norma(s) com UUID resolvido de {len(normas_unicas)} identificada(s)")
+    return mapa_uuid
+
+
+# =============================================================================
+# v3.12 — VINCULAÇÃO DE norma_legal_id E normas_relacionadas
+# =============================================================================
+
+def _vincular_normas_em_registros(
+    registros: list[dict],
+    mapa_uuid: dict[str, str],
+    tabelas: list[str] | None = None,
+) -> dict:
+    """
+    v3.12: Para cada registro, resolve as normas do base_legal usando mapa_uuid
+    e atualiza norma_legal_id + normas_relacionadas nas tabelas indicadas.
+
+    tabelas: lista de tabelas a atualizar. Default:
+      ["produtos_monofasicos", "produtos_tributacao_concentrada", "produtos_aliquota_zero"]
+
+    Retorna contadores: {tabela: {ok, erros}}
+    """
+    if not supabase or not mapa_uuid:
+        return {}
+
+    if tabelas is None:
+        tabelas = [
+            "produtos_monofasicos",
+            "produtos_tributacao_concentrada",
+            "produtos_aliquota_zero",
+        ]
+
+    resultado: dict = {t: {"ok": 0, "erros": 0} for t in tabelas}
+
+    for reg in registros:
+        ncm = reg.get("ncm")
+        if not ncm:
+            continue
+
+        bl = reg.get("base_legal") or ""
+        normas_extraidas = _extrair_normas_de_base_legal(bl)
+
+        if not normas_extraidas:
+            continue
+
+        # Resolve UUIDs para este registro
+        uuids = [
+            mapa_uuid[n["chave"]]
+            for n in normas_extraidas
+            if n["chave"] in mapa_uuid
+        ]
+
+        if not uuids:
+            continue
+
+        norma_principal  = uuids[0]
+        normas_array     = uuids  # array com todos os UUIDs
+
+        payload_update = {
+            "norma_legal_id":      norma_principal,
+            "normas_relacionadas": normas_array,
+            "updated_at":          now(),
+        }
+
+        cst = str(reg.get("cst_pis") or "").strip()
+
+        for tabela in tabelas:
+            # produtos_tributacao_concentrada só recebe CST 04
+            if tabela == "produtos_tributacao_concentrada" and cst != "04":
+                continue
+            # produtos_aliquota_zero só recebe CST 06
+            if tabela == "produtos_aliquota_zero" and cst != "06":
+                continue
+
+            # produtos_aliquota_zero não tem normas_relacionadas — remove se necessário
+            payload = dict(payload_update)
+            if tabela == "produtos_aliquota_zero":
+                payload.pop("normas_relacionadas", None)
+
+            try:
+                supabase.table(tabela).update(payload).eq("ncm", ncm).execute()
+                resultado[tabela]["ok"] += 1
+            except Exception as e:
+                log.error(f"[normas-mono] UPDATE {tabela} NCM {ncm}: {e}")
+                resultado[tabela]["erros"] += 1
+
+    for tabela, cnt in resultado.items():
+        log.info(
+            f"[normas-mono] {tabela}: "
+            f"{cnt['ok']} NCM(s) vinculado(s) | {cnt['erros']} erro(s)"
+        )
+
+    return resultado
+
+
 def mk_mono(ncm, descricao, segmento, cst_pis, natureza, base_legal, lei,
             vigencia_inicio, vigencia_fim, fonte, metodo):
-    """
-    Monta o payload para produtos_monofasicos (cadastro base puro).
-    Não inclui alíquotas nem regime_tributario — esses campos foram
-    movidos para as tabelas do motor tributário (v3.8).
-    """
     cst = cst_pis or "04"
     vig_ini = vigencia_inicio or "1998-01-01"
+    # v3.12: lei extraído com regex ampliado
+    lei_extraida = lei or _lei_curta_de_base_legal(base_legal or "")
     return {
         "ncm":              ncm,
         "descricao":        descricao,
@@ -340,7 +654,7 @@ def mk_mono(ncm, descricao, segmento, cst_pis, natureza, base_legal, lei,
         "descricao_cst":    CST_DESC.get(cst),
         "natureza_receita": natureza,
         "base_legal":       base_legal,
-        "lei":              lei,
+        "lei":              lei_extraida,
         "norma_legal_id":   None,
         "normas_relacionadas": None,
         "vigencia_inicio":  vig_ini,
@@ -416,10 +730,11 @@ def extrair_tabela_pdf(page, regime, segmento, fonte):
                 rev_m  = RE_REVOGACAO.search(cel("rev") or linha)
                 f      = fund(linha)
                 nat_m  = RE_NAT.search(cel("nat"))
+                base_l = f["ricms"] or f["convenio"]
                 if regime == "monofasico":
                     items.append(mk_mono(ncm, cel("desc") or None, segmento,
                         cel("cst") or None, nat_m.group(1) if nat_m else None,
-                        f["ricms"] or f["convenio"], cel("lei") or None,
+                        base_l, cel("lei") or None,
                         nd(vig_m.group(1)) if vig_m else None,
                         nd(rev_m.group(1)) if rev_m else None, fonte, "tabela"))
                 else:
@@ -449,9 +764,11 @@ def extrair_xlsx(conteudo, regime, fonte):
                         v = next((row[c] for c in df.columns if k in c), None)
                         if v is not None and pd.notna(v): return str(v).strip()
                     return None
+                base_l = g("base_legal") or g("lei")
+                lei_v  = _lei_curta_de_base_legal(base_l or "")
                 if regime == "monofasico":
                     items.append(mk_mono(ncm, g("descri"), g("segmento"), g("cst"), g("natureza"),
-                        g("base_legal") or g("lei"), g("lei"),
+                        base_l, lei_v,
                         nd(g("vigencia_inicio")), nd(g("vigencia_fim")), fonte, "tabela_xlsx"))
                 else:
                     items.append(mk_st(ncm, g("cest"), g("descri"), g("segmento"), g("cst"), g("csosn"),
@@ -498,10 +815,11 @@ def extrair_regex(texto, regime, segmento, fonte):
             vig_m  = RE_VIGENCIA.search(ctx)
             rev_m  = RE_REVOGACAO.search(ctx)
             nat_m  = RE_NAT.search(ctx)
+            base_l = f["ricms"] or f["convenio"]
             if regime == "monofasico":
                 items.append(mk_mono(ncm, desc, segmento, "04",
                     nat_m.group(1) if nat_m else None,
-                    f["ricms"] or f["convenio"], None,
+                    base_l, None,
                     nd(vig_m.group(1)) if vig_m else None,
                     nd(rev_m.group(1)) if rev_m else None, fonte, "regex"))
             else:
@@ -535,10 +853,12 @@ async def extrair_llm(texto, regime, fonte):
         for p in parsed:
             ncm = limpar_ncm(str(p.get("ncm", "")))
             if not ncm: continue
+            base_l = p.get("base_legal")
+            lei_v  = _lei_curta_de_base_legal(base_l or "")
             if regime == "monofasico":
                 items.append(mk_mono(ncm, p.get("descricao"), p.get("segmento"),
-                    p.get("cst_pis", "04"), p.get("natureza_receita"), p.get("base_legal"),
-                    None, None, None, fonte, "llm"))
+                    p.get("cst_pis", "04"), p.get("natureza_receita"), base_l,
+                    lei_v, None, None, fonte, "llm"))
             else:
                 items.append(mk_st(ncm, p.get("cest"), p.get("descricao"), p.get("segmento"),
                     "060", None, "5405", "6404", p.get("fundamentacao_convenio"),
@@ -563,10 +883,13 @@ def salvar(mono, st):
         try:
             supabase.table("produtos_monofasicos").upsert(mono_filtrado, on_conflict="ncm").execute()
             r["mono"] = len(mono_filtrado)
-            # ── v3.7: espelho nas tabelas do motor tributário ─────────────────
             motor = _upsert_motor_tributario(mono_filtrado, origem="extrair-ncms")
             if motor["erros"]:
                 r["erros"].extend(motor["erros"])
+            # v3.12: vincula normas após upsert
+            mapa = _upsert_normas_monofasicas(mono)
+            if mapa:
+                _vincular_normas_em_registros(mono, mapa)
         except Exception as e: r["erros"].append(f"mono:{str(e)[:200]}"); log.error(e)
     if st:
         try: supabase.table("produtos_icms_st").upsert(st, on_conflict="ncm").execute(); r["st"] = len(st)
@@ -668,11 +991,12 @@ def _svc():
     except Exception as e: log.error(f"Drive auth: {e}"); return None
 
 
-# Inicializado aqui — após _svc() estar definida (v3.10)
+# Inicializado após _svc() estar definida (v3.10)
 _FUNDAMENTACAO_LOOKUP: dict = _carregar_lookup_fundamentacao()
+
 def health():
     return {
-        "status": "ok", "versao": "3.11.0",
+        "status": "ok", "versao": "3.12.0",
         "supabase": supabase is not None,
         "pdf": HAS_PDF, "xlsx": HAS_XLSX, "docx": HAS_DOCX, "gdrive": HAS_GDRIVE,
         "removed_cols_mono": sorted(_REMOVED_COLS_MONO - {"_motor_extra"}),
@@ -686,11 +1010,13 @@ def status_db():
         s  = supabase.table("produtos_icms_st").select("ncm", count="exact").execute()
         tc = supabase.table("produtos_tributacao_concentrada").select("ncm", count="exact").execute()
         az = supabase.table("produtos_aliquota_zero").select("ncm", count="exact").execute()
+        nl = supabase.table("normas_legais").select("id", count="exact").execute()
         return {
             "produtos_monofasicos":             m.count,
             "produtos_icms_st":                 s.count,
             "produtos_tributacao_concentrada":  tc.count,
             "produtos_aliquota_zero":           az.count,
+            "normas_legais":                    nl.count,
             "timestamp": datetime.utcnow().isoformat(),
         }
     except Exception as e: return {"erro": str(e)}
@@ -784,14 +1110,9 @@ _SCHEMA_COLS: dict = {
         "anexo_id", "artigo", "dispositivo", "redacao_anterior",
         "redacao_vigente", "data_mudanca", "norma_que_alterou",
     },
-    # ── v3.4 CORREÇÃO 4 ──────────────────────────────────────────────────────
-    # Adicionados "anexo_fiscal_id" e "norma_legal_id" como aliases aceitos
-    # pelo schema — _FIELD_ALIASES resolve para "anexo_id"/"norma_id" antes
-    # de chegar aqui, mas mantemos ambos para compatibilidade retroativa
-    # com JSONs que já usavam os nomes antigos sem passar por alias.
     "anexos_normas": {
         "anexo_id", "norma_id", "papel",
-        "anexo_fiscal_id", "norma_legal_id", "tipo_relacao",  # aliases aceitos
+        "anexo_fiscal_id", "norma_legal_id", "tipo_relacao",
     },
     "produtos_icms_st": {
         "segmento", "cest", "ncm", "descricao", "fundamentacao_convenio",
@@ -802,13 +1123,6 @@ _SCHEMA_COLS: dict = {
     },
 }
 
-# ── v3.4 CORREÇÃO 1 ──────────────────────────────────────────────────────────
-# Adicionados aliases para anexos_normas:
-#   "anexo_fiscal_id" → "anexo_id"   (nome real na tabela)
-#   "norma_legal_id"  → "norma_id"   (nome real na tabela)
-#   "tipo_relacao"    → "papel"       (nome real na tabela)
-# Isso resolve os 3 FAILED do log: os campos eram ignorados por nome errado,
-# causando falha no NOT NULL de "anexo_id" e "norma_id".
 _FIELD_ALIASES: dict = {
     "normas_legais": {
         "tipo":                 "tipo_norma",
@@ -821,9 +1135,9 @@ _FIELD_ALIASES: dict = {
         "revogada":             "status",
     },
     "anexos_normas": {
-        "anexo_fiscal_id": "anexo_id",    # v3.4: alias principal
-        "norma_legal_id":  "norma_id",    # v3.4: alias principal
-        "tipo_relacao":    "papel",        # v3.4: alias para campo "papel"
+        "anexo_fiscal_id": "anexo_id",
+        "norma_legal_id":  "norma_id",
+        "tipo_relacao":    "papel",
     },
 }
 
@@ -906,14 +1220,9 @@ class _Resolver:
         return {k: self.resolve(v) for k, v in record.items()}
 
 
-# ── v3.4 CORREÇÃO 5 ──────────────────────────────────────────────────────────
-# _GlobalResolver: singleton que herda _Resolver e persiste o mapa entre
-# arquivos. Instanciado uma vez em _run_upsert_icms_jsons e passado a todos
-# os blocos, garantindo que um placeholder registrado no arquivo A seja
-# resolvido no arquivo B (ex: norma base num arquivo, produtos em outro).
 class _GlobalResolver(_Resolver):
     """Resolver compartilhado entre todos os arquivos de uma execução."""
-    pass  # herda tudo de _Resolver; a diferença é que é instanciado UMA VEZ
+    pass
 
 
 def _normalizar_registro(table: str, raw: dict, filename: str) -> dict:
@@ -992,19 +1301,13 @@ _NOT_NULL_COLS: dict = {
     "anexos_artigos":  ["anexo_id", "numero"],
     "anexos_pontos_atencao":      ["anexo_id", "descricao"],
     "anexos_comparativo_redacao": ["anexo_id", "artigo"],
-    # ── v3.4: NOT NULL agora usa os nomes REAIS da tabela (pós-alias) ────────
     "anexos_normas":              ["anexo_id", "norma_id"],
     "produtos_icms_st":           ["segmento", "ncm", "cest", "descricao", "ativo"],
 }
 
-# ── v3.4 CORREÇÕES 2 e 3 ─────────────────────────────────────────────────────
-# CORREÇÃO 2: "anexos_fiscais" adicionado com on_conflict="sigla_anexo,estado"
-#             Evita duplicatas a cada re-execução do pipeline
-# CORREÇÃO 3: "normas_legais" corrigido — removido "orgao_emissor" (nullable)
-#             "tipo_norma,numero,ano" é único e nunca nulo
 _UPSERT_CONFLICT: dict = {
-    "normas_legais":    "tipo_norma,numero,ano",           # v3.4: removido orgao_emissor (nullable)
-    "anexos_fiscais":   "sigla_anexo,estado",              # v3.4: adicionado — evita duplicatas
+    "normas_legais":    "tipo_norma,numero,ano",
+    "anexos_fiscais":   "sigla_anexo,estado",
     "produtos_icms_st": "cest,ncm,anexo_fiscal_id",
 }
 
@@ -1057,11 +1360,6 @@ def _processar_bloco(bloco_data: dict, filename: str, resolver: _Resolver) -> di
             row_norm = _sanitize_unresolved(row_norm, filename, table)
             row_norm = _normalizar_registro(table, row_norm, filename)
 
-            # ── v3.4: para anexos_normas, remover campos alias residuais ─────
-            # Após _normalizar_registro, campos como "anexo_fiscal_id" e
-            # "norma_legal_id" já foram mapeados para "anexo_id"/"norma_id".
-            # Se ambos aparecerem (original + alias), o warning de duplicado
-            # já é emitido. Aqui garantimos que só os nomes reais seguem.
             if table == "anexos_normas":
                 row_norm.pop("anexo_fiscal_id", None)
                 row_norm.pop("norma_legal_id", None)
@@ -1088,11 +1386,6 @@ def _processar_bloco(bloco_data: dict, filename: str, resolver: _Resolver) -> di
             conflict_cols = _UPSERT_CONFLICT.get(table)
 
             try:
-                # ── v3.5: normas_legais usa INSERT puro (sem UPDATE) ──────────
-                # O trigger trigger_versionar_norma dispara em BEFORE UPDATE e
-                # insere versão em normas_legais_versoes. Se a norma já existe
-                # e foi tocada nesta execução, a versão já está lá → erro 23505.
-                # Solução: INSERT simples. Se conflito unique, recupera UUID.
                 if table == "normas_legais" and conflict_cols:
                     try:
                         resp = supabase.table(table).insert(row_norm).execute()
@@ -1116,7 +1409,6 @@ def _processar_bloco(bloco_data: dict, filename: str, resolver: _Resolver) -> di
                         else:
                             raise e_insert
 
-                # ── todas as outras tabelas: upsert normal ────────────────────
                 elif conflict_cols:
                     resp = (
                         supabase.table(table)
@@ -1215,11 +1507,6 @@ async def _run_upsert_icms_jsons(folder_id: str):
 
     total  = {t: 0 for t in _TABLE_ORDER}
     erros_geral: list = []
-
-    # ── v3.4 CORREÇÃO 5 ──────────────────────────────────────────────────────
-    # Usa _GlobalResolver em vez de _Resolver local — o mapa de placeholders
-    # persiste entre todos os arquivos da pasta, resolvendo referências
-    # cruzadas (norma inserida no arquivo A → resolvida no arquivo B).
     resolver = _GlobalResolver()
 
     for file_meta in files:
@@ -1258,62 +1545,48 @@ async def _run_upsert_icms_jsons(folder_id: str):
 
 
 # =============================================================================
-# PIPELINE MONOFÁSICOS v3.4 (inalterado em relação ao v3.3)
+# PIPELINE MONOFÁSICOS — schemas e helpers
 # =============================================================================
 
 _SCHEMA_MONO = {
-    # Identificação do NCM
     "ncm", "descricao", "segmento",
-    # Classificação tributária (sem alíquotas — estão nas tabelas do motor)
     "cst_pis", "cst_cofins", "descricao_cst", "natureza_receita",
-    # Base legal
     "base_legal", "lei", "norma_legal_id", "normas_relacionadas",
-    # Vigência
     "vigencia_inicio", "vigencia_fim", "ativo",
-    # Semântico
     "content", "metadata",
-    # Rastreabilidade
     "fonte_arquivo", "metodo_extracao", "updated_at",
 }
 
 _SEGMENTO_GRUPO: list = [
-    # Combustíveis
     ("combustív",           "Combustíveis"),
     ("derivados de petról", "Combustíveis"),
     ("petróleo",            "Combustíveis"),
     ("biodiesel",           "Combustíveis"),
     ("energia elétr",       "Combustíveis"),
-    # Medicamentos / Farmácia
     ("farmacê",             "Medicamentos"),
     ("farmaci",             "Medicamentos"),
     ("fármacos",            "Medicamentos"),
     ("medicament",          "Medicamentos"),
     ("produtos farmac",     "Medicamentos"),
-    # Perfumaria e Higiene
     ("higiene",             "Perfumaria e Higiene"),
     ("cosmétic",            "Perfumaria e Higiene"),
     ("perfumaria",          "Perfumaria e Higiene"),
     ("cosméticos",          "Perfumaria e Higiene"),
-    # Veículos
     ("veículos automotor",  "Veículos"),
     ("automotor",           "Veículos"),
     ("veículos",            "Veículos"),
     ("motocicleta",         "Veículos"),
-    # Bebidas
     ("bebida",              "Bebidas Alcoólicas"),
     ("cerveja",             "Bebidas Alcoólicas"),
     ("vinho",               "Bebidas Alcoólicas"),
     ("suco",                "Bebidas Alcoólicas"),
     ("bebidas frias",       "Bebidas Alcoólicas"),
-    # Embalagens para bebidas
     ("embalagem",           "Bebidas Alcoólicas"),
-    # Máquinas / Equipamentos / Construção
     ("máquina",             "Materiais de Construção"),
     ("equipament",          "Materiais de Construção"),
     ("construção",          "Materiais de Construção"),
     ("agrícola",            "Materiais de Construção"),
     ("hortícola",           "Materiais de Construção"),
-    # Produtos Alimentícios / Cesta Básica
     ("cesta básica",        "Produtos Alimentícios"),
     ("aliment",             "Produtos Alimentícios"),
     ("laticín",             "Produtos Alimentícios"),
@@ -1324,7 +1597,6 @@ _SEGMENTO_GRUPO: list = [
     ("arroz",               "Produtos Alimentícios"),
     ("trigo",               "Produtos Alimentícios"),
     ("óleo",                "Produtos Alimentícios"),
-    # Saúde / Ortopédicos
     ("saúde",               "Saúde"),
     ("ortopéd",             "Saúde"),
     ("prótese",             "Saúde"),
@@ -1332,7 +1604,6 @@ _SEGMENTO_GRUPO: list = [
     ("portadores de defici","Saúde"),
     ("audição",             "Saúde"),
     ("lentes",              "Saúde"),
-    # Aeronaves / Embarcações
     ("aeronave",            "Aeronaves e Embarcações"),
     ("helicóptero",         "Aeronaves e Embarcações"),
     ("avião",               "Aeronaves e Embarcações"),
@@ -1366,7 +1637,6 @@ def _mapear_item_monofasico(item: dict, group_label: str, filename: str):
         log.warning(f"[mono] {filename}: NCM inválido '{ncm_raw}' — item ignorado")
         return None
 
-    # Descrição — tenta todas as variações de nome do campo
     descricao = (
         str(item.get("descricao") or
             item.get("description") or
@@ -1375,7 +1645,6 @@ def _mapear_item_monofasico(item: dict, group_label: str, filename: str):
         or "Sem descrição"
     )
 
-    # CST — tenta todas as variações de nome do campo
     cst_raw = str(
         item.get("cst_pis") or
         item.get("cst_mono_04") or
@@ -1386,7 +1655,7 @@ def _mapear_item_monofasico(item: dict, group_label: str, filename: str):
     if cst_raw.isdigit() and len(cst_raw) > 2 and int(cst_raw) < 100:
         cst_raw = str(int(cst_raw)).zfill(2)
 
-    # Base legal — tenta todas as variações de nome do campo
+    # base_legal — tenta todas as variações de nome do campo
     legal_basis = (
         str(item.get("base_legal") or
             item.get("legal_basis") or
@@ -1395,11 +1664,11 @@ def _mapear_item_monofasico(item: dict, group_label: str, filename: str):
         or None
     )
 
+    # v3.12: campo `lei` extraído com regex ampliado
+    lei = _lei_curta_de_base_legal(legal_basis or "")
+
     cod_nat = str(item.get("cod_nat_rec") or item.get("natureza_receita") or "").strip() or None
 
-    # ── Alíquotas: lidas do JSON para uso EXCLUSIVO pelo motor tributário ──────
-    # Não são mais gravadas em produtos_monofasicos (v3.8).
-    # São repassadas via _preparar_payload_motor() para as tabelas do motor.
     def _aliq(campo_sped, campo_alt, fallback):
         v = _parse_aliq(item.get(campo_sped)) or _parse_aliq(item.get(campo_alt))
         if v is not None:
@@ -1425,17 +1694,11 @@ def _mapear_item_monofasico(item: dict, group_label: str, filename: str):
         aliq_pis_real  = _aliq("al_pis_norm_percent", "aliq_pis_real",        1.65)
         aliq_cof_real  = _aliq("al_cof_norm_percent", "aliq_cofins_real",     7.6)
 
-    lei = None
-    if legal_basis:
-        lei_match = RE_LEI.search(legal_basis)
-        lei = "Lei " + lei_match.group(1) if lei_match else None
-
-    segmento   = _segmento_por_grupo(group_label)
-    vig_inicio = nd(str(item.get("vigencia_inicio") or "").strip()) or "1998-01-01"
-    vig_fim    = nd(str(item.get("vigencia_fim") or "").strip())
+    segmento    = _segmento_por_grupo(group_label)
+    vig_inicio  = nd(str(item.get("vigencia_inicio") or "").strip()) or "1998-01-01"
+    vig_fim     = nd(str(item.get("vigencia_fim") or "").strip())
     regime_trib = "aliquota_zero" if cst_raw == "06" else "monofasico"
 
-    # ── Payload para produtos_monofasicos (cadastro base — sem alíquotas) ──────
     payload_base = {
         "ncm":                 ncm,
         "descricao":           descricao,
@@ -1446,8 +1709,8 @@ def _mapear_item_monofasico(item: dict, group_label: str, filename: str):
         "natureza_receita":    cod_nat,
         "base_legal":          legal_basis,
         "lei":                 lei,
-        "norma_legal_id":      None,
-        "normas_relacionadas": None,
+        "norma_legal_id":      None,   # preenchido por _vincular_normas_em_registros
+        "normas_relacionadas": None,   # preenchido por _vincular_normas_em_registros
         "vigencia_inicio":     vig_inicio,
         "vigencia_fim":        vig_fim,
         "ativo":               vig_fim is None,
@@ -1458,9 +1721,6 @@ def _mapear_item_monofasico(item: dict, group_label: str, filename: str):
         "updated_at":          now(),
     }
 
-    # ── Payload estendido para o motor tributário (inclui alíquotas e regime) ──
-    # Armazenado em _motor_extra para uso por _preparar_payload_motor().
-    # NÃO é enviado para produtos_monofasicos.
     payload_base["_motor_extra"] = {
         "aliq_pis_simples":      0,
         "aliq_cofins_simples":   0,
@@ -1480,13 +1740,10 @@ def _mapear_item_monofasico(item: dict, group_label: str, filename: str):
 
 
 # =============================================================================
-# MOTOR TRIBUTÁRIO — espelho paralelo em produtos_tributacao_concentrada
-#                    e produtos_aliquota_zero (v3.7)
-# A tabela produtos_monofasicos permanece intacta e é gravada normalmente.
-# Estas funções apenas duplicam os dados nas novas tabelas do motor.
+# MOTOR TRIBUTÁRIO — espelho em produtos_tributacao_concentrada e
+#                    produtos_aliquota_zero (v3.7)
 # =============================================================================
 
-# Campos aceitos por cada tabela do motor tributário
 _SCHEMA_TRIB_CONC = {
     "ncm", "descricao", "segmento", "cst_pis", "cst_cofins",
     "descricao_cst", "natureza_receita", "regime_tributario",
@@ -1515,7 +1772,6 @@ _SCHEMA_ALIQ_ZERO = {
     "fonte_arquivo", "metodo_extracao", "updated_at",
 }
 
-# Segmentos válidos como enum no banco — qualquer outro vira 'Não identificado'
 _SEGMENTOS_VALIDOS = frozenset({
     "Combustíveis", "Medicamentos", "Perfumaria e Higiene", "Veículos",
     "Bebidas Alcoólicas", "Produtos Alimentícios", "Saúde",
@@ -1524,7 +1780,6 @@ _SEGMENTOS_VALIDOS = frozenset({
     "Cigarros e Tabaco", "Rações Pet", "Eletrônicos", "Não identificado",
 })
 
-# Inferência de grupo_legal a partir do nome do arquivo JSON de origem
 _GRUPO_LEGAL_POR_ARQUIVO = {
     "cesta_basica":    "cesta_basica",
     "cesta básica":    "cesta_basica",
@@ -1542,7 +1797,6 @@ _GRUPO_LEGAL_POR_ARQUIVO = {
 
 
 def _inferir_grupo_legal(fonte_arquivo: str) -> str | None:
-    """Infere grupo_legal a partir do nome do arquivo JSON de origem."""
     if not fonte_arquivo:
         return None
     fl = fonte_arquivo.lower()
@@ -1553,12 +1807,6 @@ def _inferir_grupo_legal(fonte_arquivo: str) -> str | None:
 
 
 def _preparar_payload_motor(registro: dict, tabela: str) -> dict | None:
-    """
-    Adapta o payload do pipeline para o schema das tabelas do motor tributário.
-    As alíquotas e regime_tributario vêm de registro['_motor_extra']
-    (campo interno preenchido por _mapear_item_monofasico, nunca gravado
-    em produtos_monofasicos).
-    """
     ncm = registro.get("ncm")
     if not ncm:
         return None
@@ -1570,7 +1818,6 @@ def _preparar_payload_motor(registro: dict, tabela: str) -> dict | None:
     if tabela == "produtos_aliquota_zero" and cst != "06":
         return None
 
-    # Lê alíquotas e regime do campo interno _motor_extra
     extra = registro.get("_motor_extra") or {}
     aliq_pis_pres  = extra.get("aliq_pis_presumido")
     aliq_cof_pres  = extra.get("aliq_cofins_presumido")
@@ -1639,13 +1886,6 @@ def _preparar_payload_motor(registro: dict, tabela: str) -> dict | None:
 
 
 def _upsert_motor_tributario(registros: list, origem: str = "") -> dict:
-    """
-    Recebe a lista de registros já gravados em produtos_monofasicos e
-    os espelha nas tabelas do motor tributário conforme o CST de cada um.
-
-    Retorna contadores por tabela e lista de erros.
-    Falhas aqui NÃO interrompem o pipeline principal.
-    """
     if not supabase or not registros:
         return {"trib_conc": 0, "aliq_zero": 0, "erros": []}
 
@@ -1662,12 +1902,10 @@ def _upsert_motor_tributario(registros: list, origem: str = "") -> dict:
             p = _preparar_payload_motor(reg, "produtos_aliquota_zero")
             if p:
                 lote_cst06.append(p)
-        # outros CSTs (01, 02, etc.): não entram nas tabelas do motor
 
     resultado = {"trib_conc": 0, "aliq_zero": 0, "erros": []}
     BATCH = 500
 
-    # Upsert em produtos_tributacao_concentrada
     for i in range(0, len(lote_cst04), BATCH):
         lote = lote_cst04[i:i + BATCH]
         try:
@@ -1682,11 +1920,9 @@ def _upsert_motor_tributario(registros: list, origem: str = "") -> dict:
                 f"{len(lote)} registro(s) → produtos_tributacao_concentrada"
             )
         except Exception as e:
-            msg = f"motor:cst04:{str(e)[:200]}"
-            resultado["erros"].append(msg)
+            resultado["erros"].append(f"motor:cst04:{str(e)[:200]}")
             log.error(f"[motor] {origem} upsert produtos_tributacao_concentrada: {e}")
 
-    # Upsert em produtos_aliquota_zero
     for i in range(0, len(lote_cst06), BATCH):
         lote = lote_cst06[i:i + BATCH]
         try:
@@ -1701,8 +1937,7 @@ def _upsert_motor_tributario(registros: list, origem: str = "") -> dict:
                 f"{len(lote)} registro(s) → produtos_aliquota_zero"
             )
         except Exception as e:
-            msg = f"motor:cst06:{str(e)[:200]}"
-            resultado["erros"].append(msg)
+            resultado["erros"].append(f"motor:cst06:{str(e)[:200]}")
             log.error(f"[motor] {origem} upsert produtos_aliquota_zero: {e}")
 
     log.info(
@@ -1778,13 +2013,15 @@ async def _run_upsert_monofasicos(folder_id: str):
 
     log.info(f"[mono] {len(files)} arquivo(s) JSON na pasta {folder_id}")
 
-    # Filtra arquivos auxiliares que não são JSONs de produtos monofásicos
     ARQUIVOS_IGNORAR = {"fundamentacao_lookup.json"}
     files = [f for f in files if f["name"] not in ARQUIVOS_IGNORAR]
     log.info(f"[mono] {len(files)} arquivo(s) JSON após filtro de auxiliares")
 
     total_inseridos = 0
     total_erros     = 0
+
+    # v3.12: acumula todos os registros da pasta para upsert de normas em lote
+    todos_registros: list = []
 
     for file_meta in files:
         file_id  = file_meta["id"]
@@ -1811,16 +2048,9 @@ async def _run_upsert_monofasicos(folder_id: str):
         registros = dedup(registros)
         log.info(f"[mono] '{filename}': {len(registros)} registro(s) após dedup")
 
-        # ── v3.9: NÃO filtra aqui — preserva _motor_extra para o motor ───────
-        # O filtro é aplicado por lote apenas no momento do upsert em
-        # produtos_monofasicos, garantindo que _upsert_motor_tributario
-        # receba o lote original com _motor_extra intacto.
-
         BATCH = 500
         for i in range(0, len(registros), BATCH):
             lote = registros[i:i + BATCH]
-
-            # Filtra APENAS para o upsert em produtos_monofasicos
             lote_mono = [_filtrar_payload_mono(r) for r in lote]
 
             try:
@@ -1835,7 +2065,6 @@ async def _run_upsert_monofasicos(folder_id: str):
                     f"[mono] '{filename}' lote {i//BATCH + 1}: "
                     f"{n_ok} registro(s) upserted em produtos_monofasicos"
                 )
-                # Motor recebe lote original (com _motor_extra intacto)
                 _upsert_motor_tributario(lote, origem=f"'{filename}' lote {i//BATCH + 1}")
             except Exception as e:
                 log.error(
@@ -1843,6 +2072,18 @@ async def _run_upsert_monofasicos(folder_id: str):
                     f"upsert erro — {e}"
                 )
                 total_erros += len(lote)
+
+        todos_registros.extend(registros)
+
+    # v3.12: upsert das normas em lote único (após todos os arquivos)
+    # e vinculação de norma_legal_id + normas_relacionadas
+    if todos_registros:
+        log.info(f"[normas-mono] Iniciando upsert de normas para {len(todos_registros)} registro(s)…")
+        mapa_uuid = _upsert_normas_monofasicas(todos_registros)
+        if mapa_uuid:
+            _vincular_normas_em_registros(todos_registros, mapa_uuid)
+        else:
+            log.warning("[normas-mono] Nenhum UUID resolvido — vinculação ignorada")
 
     log.info(
         f"[mono] ✓ CONCLUÍDO — "
@@ -1938,33 +2179,39 @@ def status_monofasicos():
         )
         ativos = ativos_resp.count
 
+        # v3.12: inclui contagem de normas vinculadas
+        vinculados_resp = (
+            supabase.table("produtos_monofasicos")
+            .select("id", count="exact")
+            .not_.is_("norma_legal_id", "null")
+            .execute()
+        )
+        vinculados = vinculados_resp.count
+
         recentes_resp = (
             supabase.table("produtos_monofasicos")
-            .select("ncm, descricao, segmento, cst_pis, fonte_arquivo, updated_at")
+            .select("ncm, descricao, segmento, cst_pis, lei, norma_legal_id, fonte_arquivo, updated_at")
             .order("updated_at", desc=True)
             .limit(5)
             .execute()
         )
 
         return {
-            "total":     total,
-            "ativos":    ativos,
-            "inativos":  (total or 0) - (ativos or 0),
-            "recentes":  recentes_resp.data or [],
-            "timestamp": datetime.utcnow().isoformat(),
+            "total":               total,
+            "ativos":              ativos,
+            "inativos":            (total or 0) - (ativos or 0),
+            "com_norma_vinculada": vinculados,
+            "sem_norma_vinculada": (total or 0) - (vinculados or 0),
+            "recentes":            recentes_resp.data or [],
+            "timestamp":           datetime.utcnow().isoformat(),
         }
     except Exception as e:
         return {"erro": str(e)}
 
 
 # =============================================================================
-# CARGA XLSX — lê Tabela_Excel_Produtos_Monofásicos.xlsx do Drive e
-# faz upsert direto em produtos_monofasicos (carga histórica oficial RFB/SPED)
+# CARGA XLSX — lê Tabela_Excel_Produtos_Monofásicos.xlsx do Drive
 # =============================================================================
-
-RE_LEI_XLSX = re.compile(
-    r'Lei\s+(?:Complementar\s+)?(?:n[oº]?\s*)?(\d+[\.\d]*[/\-]\d+)', re.I
-)
 
 _VIGENCIA_XLSX = {
     "combustív":  "1998-01-01",
@@ -1991,11 +2238,6 @@ _SEGMENTO_XLSX = {
 NOME_XLSX = "Tabela_Excel_Produtos_Monofásicos.xlsx"
 
 
-def _extrair_lei_xlsx(texto: str) -> str | None:
-    m = RE_LEI_XLSX.search(str(texto) if texto else "")
-    return "Lei " + m.group(1) if m else None
-
-
 def _vigencia_xlsx(grupo: str) -> str:
     gl = str(grupo).lower()
     for f, d in _VIGENCIA_XLSX.items():
@@ -2013,7 +2255,6 @@ def _segmento_xlsx(grupo: str) -> str:
 
 
 def _mapear_linha_xlsx(row) -> dict | None:
-    """Converte uma linha do DataFrame para payload de produtos_monofasicos."""
     try:
         import pandas as pd
         ncm = re.sub(r"[^0-9]", "", str(row["NCM"]).strip())
@@ -2022,7 +2263,9 @@ def _mapear_linha_xlsx(row) -> dict | None:
 
         descricao  = str(row["Descrição"]).strip()
         base_legal = str(row["Legislação"]).strip().rstrip(";").strip()
-        lei        = _extrair_lei_xlsx(base_legal)
+
+        # v3.12: lei extraído com regex ampliado
+        lei        = _lei_curta_de_base_legal(base_legal)
         natureza   = str(int(row["Cod Grupo"])) if pd.notna(row["Cod Grupo"]) else None
         grupo      = str(row["Grupo"]).strip()
 
@@ -2045,8 +2288,8 @@ def _mapear_linha_xlsx(row) -> dict | None:
             "vigencia_fim":      None,
             "ativo":             True,
             "restricao_fiscal":  restricao,
-            "norma_legal_id":    None,
-            "normas_relacionadas": None,
+            "norma_legal_id":    None,   # preenchido por _vincular_normas_em_registros
+            "normas_relacionadas": None, # preenchido por _vincular_normas_em_registros
             "content":           None,
             "metadata":          None,
             "fonte_arquivo":     NOME_XLSX,
@@ -2059,17 +2302,10 @@ def _mapear_linha_xlsx(row) -> dict | None:
 
 
 def _run_carga_xlsx(folder_id: str):
-    """
-    Background task:
-      1. Localiza o arquivo XLSX na pasta do Drive
-      2. Baixa para memória
-      3. Lê com pandas
-      4. Mapeia e faz upsert em lotes em produtos_monofasicos
-    """
     try:
         import pandas as pd
     except ImportError:
-        log.error("[xlsx] pandas não instalado — adicione 'pandas openpyxl' ao requirements.txt")
+        log.error("[xlsx] pandas não instalado")
         return
 
     log.info(f"[xlsx] Iniciando carga de '{NOME_XLSX}' da pasta {folder_id}")
@@ -2079,7 +2315,6 @@ def _run_carga_xlsx(folder_id: str):
         log.error("[xlsx] Google Drive não disponível")
         return
 
-    # Localizar o arquivo XLSX na pasta
     try:
         arquivos = (
             svc.files()
@@ -2101,13 +2336,11 @@ def _run_carga_xlsx(folder_id: str):
 
     if not arquivos:
         log.error(f"[xlsx] '{NOME_XLSX}' não encontrado na pasta {folder_id}")
-        log.error("[xlsx] Faça o upload do arquivo na pasta do Drive e tente novamente")
         return
 
     file_id = arquivos[0]["id"]
     log.info(f"[xlsx] Arquivo encontrado: id={file_id} | Baixando…")
 
-    # Baixar para BytesIO
     try:
         buf = io.BytesIO()
         dl  = MediaIoBaseDownload(buf, svc.files().get_media(fileId=file_id))
@@ -2120,7 +2353,6 @@ def _run_carga_xlsx(folder_id: str):
         log.error(f"[xlsx] Falha ao baixar arquivo: {e}")
         return
 
-    # Ler com pandas
     try:
         df = pd.read_excel(buf, engine="openpyxl")
         log.info(f"[xlsx] Planilha carregada: {len(df)} linhas | colunas: {list(df.columns)}")
@@ -2128,7 +2360,6 @@ def _run_carga_xlsx(folder_id: str):
         log.error(f"[xlsx] Falha ao ler Excel: {e}")
         return
 
-    # Mapear linhas
     registros = []
     ignorados = 0
     for _, row in df.iterrows():
@@ -2140,7 +2371,6 @@ def _run_carga_xlsx(folder_id: str):
 
     log.info(f"[xlsx] Mapeados: {len(registros)} | ignorados: {ignorados}")
 
-    # Upsert em lotes de 100
     total_ok = total_err = 0
     BATCH = 100
     for i in range(0, len(registros), BATCH):
@@ -2159,7 +2389,6 @@ def _run_carga_xlsx(folder_id: str):
             )
         except Exception as e:
             log.error(f"[xlsx] Lote {i//BATCH + 1} falhou: {e}")
-            # Tenta um a um
             for reg in lote:
                 try:
                     supabase.table("produtos_monofasicos")\
@@ -2170,10 +2399,21 @@ def _run_carga_xlsx(folder_id: str):
                     log.error(f"[xlsx] NCM {reg.get('ncm')} falhou: {e2}")
                     total_err += 1
 
-    # Relatório final
+    # v3.12: upsert de normas e vinculação após carga XLSX
+    log.info(f"[normas-mono] Iniciando upsert de normas para {len(registros)} registro(s) do XLSX…")
+    mapa_uuid = _upsert_normas_monofasicas(registros)
+    if mapa_uuid:
+        _vincular_normas_em_registros(
+            registros,
+            mapa_uuid,
+            tabelas=["produtos_monofasicos"],  # XLSX só alimenta produtos_monofasicos
+        )
+    else:
+        log.warning("[normas-mono] XLSX: nenhum UUID resolvido — vinculação ignorada")
+
     from collections import Counter
     segs = Counter(r["segmento"] for r in registros)
-    com_restricao = sum(1 for r in registros if r["restricao_fiscal"])
+    com_restricao = sum(1 for r in registros if r.get("restricao_fiscal"))
 
     log.info("[xlsx] ==========================================")
     log.info(f"[xlsx] CARGA CONCLUÍDA")
@@ -2192,13 +2432,9 @@ async def carga_xlsx_monofasicos(
     folder_id: Optional[str] = None,
 ):
     """
-    Lê o arquivo Tabela_Excel_Produtos_Monofásicos.xlsx da pasta do Drive
-    e faz upsert de todos os 828 NCMs em produtos_monofasicos.
-
-    O arquivo deve estar na mesma pasta apontada por DRIVE_FOLDER_ID_MONO.
+    Lê o arquivo Tabela_Excel_Produtos_Monofásicos.xlsx da pasta do Drive,
+    faz upsert dos NCMs em produtos_monofasicos e vincula norma_legal_id.
     Carga idempotente — pode ser chamada quantas vezes quiser.
-
-    Acompanhe o progresso nos logs do Railway.
     """
     if not supabase:
         raise HTTPException(503, "Supabase não configurado")
@@ -2220,6 +2456,69 @@ async def carga_xlsx_monofasicos(
         "tabela":    "produtos_monofasicos",
         "info":      "Acompanhe os logs do Railway para progresso detalhado",
     }
+
+
+# =============================================================================
+# ENDPOINT AVULSO — v3.12: vincula normas em registros já existentes no banco
+# =============================================================================
+
+@app.post("/vincular-normas-monofasicos")
+async def vincular_normas_monofasicos(background_tasks: BackgroundTasks):
+    """
+    Endpoint utilitário v3.12:
+    Lê todos os registros de produtos_monofasicos que ainda não têm
+    norma_legal_id preenchido, extrai as normas de base_legal,
+    insere em normas_legais e vincula os UUIDs.
+
+    Útil para retroativamente corrigir registros carregados antes da v3.12.
+    Pode ser chamado quantas vezes quiser — é idempotente.
+    """
+    if not supabase:
+        raise HTTPException(503, "Supabase não configurado")
+
+    background_tasks.add_task(_run_vincular_normas_retroativo)
+    return {
+        "status": "iniciado",
+        "info":   "Vinculação retroativa de normas iniciada. Acompanhe os logs.",
+    }
+
+
+async def _run_vincular_normas_retroativo():
+    """
+    Background task: busca registros sem norma_legal_id e vincula.
+    Processa em lotes de 500 para não sobrecarregar o Supabase.
+    """
+    if not supabase:
+        return
+
+    log.info("[normas-mono] Iniciando vinculação retroativa…")
+
+    try:
+        resp = (
+            supabase.table("produtos_monofasicos")
+            .select("ncm, base_legal, cst_pis, cst_cofins, lei, fonte_arquivo, metodo_extracao, vigencia_inicio, vigencia_fim, ativo")
+            .is_("norma_legal_id", "null")
+            .not_.is_("base_legal", "null")
+            .execute()
+        )
+        registros = resp.data or []
+    except Exception as e:
+        log.error(f"[normas-mono] Falha ao buscar registros sem norma_legal_id: {e}")
+        return
+
+    if not registros:
+        log.info("[normas-mono] Nenhum registro sem norma_legal_id encontrado — nada a fazer")
+        return
+
+    log.info(f"[normas-mono] {len(registros)} registro(s) sem norma_legal_id encontrado(s)")
+
+    mapa_uuid = _upsert_normas_monofasicas(registros)
+    if mapa_uuid:
+        _vincular_normas_em_registros(registros, mapa_uuid)
+    else:
+        log.warning("[normas-mono] Retroativo: nenhum UUID resolvido")
+
+    log.info("[normas-mono] ✓ Vinculação retroativa concluída")
 
 
 if __name__ == "__main__":
