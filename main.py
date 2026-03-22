@@ -1,8 +1,26 @@
 """
-Microserviço de Extração Fiscal v3.8
+Microserviço de Extração Fiscal v3.10
 =====================================
 Três camadas: Determinístico → Regex → Semântico (LLM)
 Mapeado para a estrutura REAL das tabelas no Supabase.
+
+v3.10 — Correções pós-deploy (2026-03-22):
+        • BUG 1 CORRIGIDO — name '_svc' is not defined na inicialização:
+          _FUNDAMENTACAO_LOOKUP era inicializado no topo do módulo, antes
+          de _svc() ser definida. Movido para depois de _svc().
+        • BUG 2 CORRIGIDO — fundamentacao_lookup.json sendo processado
+          como JSON monofásico: _run_upsert_monofasicos agora filtra
+          arquivos cujo nome é 'fundamentacao_lookup.json' antes de
+          tentar extrair registros.
+        • Nenhuma outra lógica alterada.
+
+v3.9 — Correção _run_upsert_monofasicos: preserva _motor_extra para o motor (2026-03-21):
+        • BUG CORRIGIDO — _filtrar_payload_mono era aplicado sobre o lote
+          ANTES de chamar _upsert_motor_tributario, removendo _motor_extra
+          e deixando o motor tributário sem as alíquotas necessárias.
+        • CORREÇÃO: lote original (com _motor_extra) vai para
+          _upsert_motor_tributario; lote_mono (filtrado) vai para
+          produtos_monofasicos. Duas variáveis distintas por iteração.
 
 v3.8 — produtos_monofasicos como cadastro base puro (2026-03-21):
         • DECISÃO ARQUITETURAL: produtos_monofasicos é cadastro base de NCMs.
@@ -12,15 +30,9 @@ v3.8 — produtos_monofasicos como cadastro base puro (2026-03-21):
           aliq_pis_presumido, aliq_cofins_presumido, aliq_pis_real,
           aliq_cofins_real e regime_tributario.
         • mk_mono(): removidos todos os campos de alíquota e regime.
-          A função agora retorna apenas os campos do cadastro base.
         • _mapear_item_monofasico(): idem — sem alíquotas nem regime.
-          Os campos de alíquota continuam sendo lidos do JSON e repassados
-          para _upsert_motor_tributario() via _preparar_payload_motor(),
-          mas NÃO são mais enviados para produtos_monofasicos.
         • _filtrar_payload_mono(): garante que nenhum campo excluído
           escoe para o upsert em produtos_monofasicos.
-        • Nenhuma outra lógica alterada.
-        • O espelho nas tabelas do motor tributário (v3.7) continua intacto.
 
 v3.7 — Espelho paralelo nas novas tabelas do motor tributário (2026-03-20):
         • produtos_monofasicos: INTACTA — pipeline e banco inalterados.
@@ -30,94 +42,21 @@ v3.7 — Espelho paralelo nas novas tabelas do motor tributário (2026-03-20):
             cst_pis='06' → produtos_aliquota_zero
             outros CSTs  → ignorado (não entra nas tabelas do motor)
         • NOVO: _preparar_payload_motor() — adapta o payload do pipeline
-          para o schema das novas tabelas (aliquota_por_pauta derivada de
-          aliq_pis_presumido IS NULL, grupo_legal inferido do fonte_arquivo).
+          para o schema das novas tabelas.
         • NOVO: _upsert_motor_tributario() — persiste em lote nas novas
           tabelas em paralelo ao upsert em produtos_monofasicos.
-        • _run_upsert_monofasicos(): mantém upsert em produtos_monofasicos
-          inalterado + chama _upsert_motor_tributario() após cada lote.
-        • salvar(): mantém upsert em produtos_monofasicos inalterado
-          + chama _upsert_motor_tributario() para os registros monofásicos.
-        • Nenhuma outra lógica alterada.
 
 v3.6 — Correções pipeline produtos_monofasicos (2026-03-20):
-        • BUG 1 CORRIGIDO — descricao sempre "Sem descrição":
-          _mapear_item_monofasico buscava chave "description" (inglês).
-          Agora tenta "descricao" | "description" | "produto" | "mercadoria".
-        • BUG 2 CORRIGIDO — base_legal e lei sempre null:
-          Buscava só "legal_basis". Agora tenta "base_legal" | "legal_basis" |
-          "fundamento_legal" | "fundamentacao" com fallback seguro.
-        • BUG 3 CORRIGIDO — alíquotas presumido/real null em vez dos defaults:
-          _mapear_item_monofasico não aplicava fallback quando os campos
-          al_pis_maj_percent etc. estavam ausentes no JSON.
-          Agora aplica fallback: pis_presumido=0.65, cofins_presumido=3.0,
-          pis_real=1.65, cofins_real=7.6 (Simples Nacional permanece 0).
-          NCMs com "var." (bebidas por pauta) continuam null — correto.
-        • BUG 4 CORRIGIDO — cst_pis/cst_cofins não respeitavam CST 01 e 06:
-          Campos cst_mono_04, cst e cst_pis agora todos tentados em ordem.
-          CST 06 (alíquota zero) e CST 01 (tributável básico) preservados.
-        • _segmento_por_grupo expandido: "cesta", "aeronave", "embarcação",
-          "saúde", "farmacê", "cosmétic", "embalagem" adicionados.
-        • mk_mono atualizado: aliq_pis_presumido=0.65, aliq_cofins_presumido=3.0
-          (estava incorreto: 0.65 e 3.0 já eram corretos, mas CST_DESC["06"]
-          não existia — adicionado).
-        • CST_DESC expandido com CST "02" e "06".
+        • BUG 1 CORRIGIDO — descricao sempre "Sem descrição"
+        • BUG 2 CORRIGIDO — base_legal e lei sempre null
+        • BUG 3 CORRIGIDO — alíquotas presumido/real null
+        • BUG 4 CORRIGIDO — cst_pis/cst_cofins não respeitavam CST 01 e 06
 
-v3.5 — Correção trigger normas_legais_versoes (2026-03-19):
-        • normas_legais usa INSERT puro em vez de upsert
-        • Evita disparo do trigger trigger_versionar_norma em UPDATE
-        • Se norma já existe (23505), recupera UUID via SELECT
-        • Resolve erro: duplicate key value violates unique constraint
-          "normas_legais_versoes_norma_id_versao_key"
-
-v3.4 — Correções de persistência relacional (2026-03-19):
-        • CORREÇÃO 1 — _FIELD_ALIASES["anexos_normas"] adicionado:
-          "anexo_fiscal_id" → "anexo_id"
-          "norma_legal_id"  → "norma_id"
-          "tipo_relacao"    → "papel"
-          Resolve os 3 FAILED do log (campos ignorados por nome errado)
-        • CORREÇÃO 2 — _UPSERT_CONFLICT["anexos_fiscais"] adicionado:
-          on_conflict="sigla_anexo,estado"
-          Evita duplicatas a cada re-execução do pipeline
-        • CORREÇÃO 3 — _UPSERT_CONFLICT["normas_legais"] corrigido:
-          Removido orgao_emissor (nullable → quebrava o upsert no Postgres)
-          Novo valor: "tipo_norma,numero,ano"
-        • CORREÇÃO 4 — _SCHEMA_COLS["anexos_normas"] expandido:
-          Adicionados "anexo_fiscal_id" e "norma_legal_id" como campos
-          aceitos (aliases resolvidos antes de chegar ao schema check)
-        • CORREÇÃO 5 — _run_upsert_icms_jsons usa _GlobalResolver:
-          Placeholders agora persistem entre arquivos na mesma execução
-          (ex: norma inserida no arquivo A é resolvida no arquivo B)
-        • Nenhuma outra lógica alterada — Farinha de Trigo continua OK
-
-v3.3 — Correcao vigencia_inicio NOT NULL / aliq_cofins_presumido:
-        • Ambas as colunas confirmadas como NEVER GENERATED via
-          information_schema (verificado em 17/03/2026)
-        • _GENERATED_COLS_MONO introduzida como guarda de segurança
-        • _filtrar_payload_mono(): remove automaticamente qualquer coluna
-          da lista _GENERATED_COLS_MONO antes do upsert
-
-v3.1 — Correção aliq_pis_simples / aliq_cofins_simples:
-        • Colunas convertidas de GENERATED ALWAYS AS para numeric normal
-
+v3.5 — Correção trigger normas_legais_versoes (2026-03-19)
+v3.4 — Correções de persistência relacional (2026-03-19)
+v3.3 — Correção vigencia_inicio NOT NULL / aliq_cofins_presumido
+v3.1 — Correção aliq_pis_simples / aliq_cofins_simples
 v3.0 — Pipeline independente para produtos_monofasicos via JSON
-
-v2.9 — descricao_cst nula para cst_icms="60"
-
-v2.8 — Resolver global entre arquivos para anexos_normas
-
-v2.7 — NCM multi-valor explodido em linhas individuais
-v2.6 — Idempotência e RLS em produtos_icms_st
-v2.5 — Correção de regex _PH_RE (minúsculas e hífens)
-v2.4 — Correções críticas de RLS, colisão de variável, aliases e normas_legais
-
-──────────────────────────────────────────────────────────────────────────────
-Estado atual das colunas de produtos_monofasicos (17/03/2026):
-  GENERATED (nunca enviar):  — nenhuma —
-  NORMAL    (enviar sempre):  aliq_pis_simples, aliq_cofins_simples,
-                               aliq_pis_presumido, aliq_cofins_presumido,
-                               aliq_pis_real, aliq_cofins_real
-──────────────────────────────────────────────────────────────────────────────
 """
 
 import os, re, io, json, base64, logging
@@ -167,7 +106,7 @@ try:
     HAS_GDRIVE = True
 except: HAS_GDRIVE = False
 
-app = FastAPI(title="Extrator Fiscal v3.9", version="3.9.0")
+app = FastAPI(title="Extrator Fiscal v3.10", version="3.10.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -318,7 +257,8 @@ def _carregar_lookup_fundamentacao() -> dict:
     return {}
 
 
-_FUNDAMENTACAO_LOOKUP: dict = _carregar_lookup_fundamentacao()
+# ATENÇÃO: _FUNDAMENTACAO_LOOKUP é inicializado APÓS _svc() ser definida.
+# Ver linha abaixo de _svc() — movido em v3.10 para evitar NameError na inicialização.
 
 PADROES_MONO = [
     r"monof[aá]sico", r"pis[/\s]+cofins", r"lei\s+10\.147",
@@ -757,10 +697,11 @@ def _svc():
     except Exception as e: log.error(f"Drive auth: {e}"); return None
 
 
-@app.get("/health")
+# Inicializado aqui — após _svc() estar definida (v3.10)
+_FUNDAMENTACAO_LOOKUP: dict = _carregar_lookup_fundamentacao()
 def health():
     return {
-        "status": "ok", "versao": "3.9.0",
+        "status": "ok", "versao": "3.10.0",
         "supabase": supabase is not None,
         "pdf": HAS_PDF, "xlsx": HAS_XLSX, "docx": HAS_DOCX, "gdrive": HAS_GDRIVE,
         "removed_cols_mono": sorted(_REMOVED_COLS_MONO - {"_motor_extra"}),
@@ -1866,7 +1807,10 @@ async def _run_upsert_monofasicos(folder_id: str):
 
     log.info(f"[mono] {len(files)} arquivo(s) JSON na pasta {folder_id}")
 
-    total_inseridos = 0
+    # Filtra arquivos auxiliares que não são JSONs de produtos monofásicos
+    ARQUIVOS_IGNORAR = {"fundamentacao_lookup.json"}
+    files = [f for f in files if f["name"] not in ARQUIVOS_IGNORAR]
+    log.info(f"[mono] {len(files)} arquivo(s) JSON após filtro de auxiliares")
     total_erros     = 0
 
     for file_meta in files:
