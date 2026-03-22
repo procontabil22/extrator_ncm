@@ -1,10 +1,34 @@
 """
-Microserviço de Extração Fiscal v3.13
+Microserviço de Extração Fiscal v3.14
 =====================================
 Três camadas: Determinístico → Regex → Semântico (LLM)
 Mapeado para a estrutura REAL das tabelas no Supabase.
 
-v3.13 — Correção tabela de normas PIS/COFINS (2026-03-22):
+v3.14 — Correções regex e RLS (2026-03-22):
+        • CORRIGIDO: regex RE_LEI_MONO agora rejeita anos fora do intervalo
+          válido 1988–2026. O XLSX continha textos como "Lei 10.485/2002,
+          art. 2º, I" onde o regex capturava "2", "3", "I" como anos falsos,
+          gerando normas fantasma como "Lei 10.485/2003" ... "Lei 10.485/2032".
+          Solução: _ano4() agora retorna None para anos inválidos e
+          _extrair_normas_de_base_legal() ignora entradas com ano None.
+        • CORRIGIDO: RLS (Row Level Security) bloqueava inserts em
+          normas_legais_pis_cofins com erro 42501 (401 Unauthorized).
+          O microserviço usa service_role key que bypassa RLS por padrão,
+          mas a tabela foi criada com RLS habilitado sem política permissiva
+          para service_role. Solução: executar no Supabase SQL Editor:
+
+            ALTER TABLE normas_legais_pis_cofins ENABLE ROW LEVEL SECURITY;
+            CREATE POLICY "service_role_full_access"
+              ON normas_legais_pis_cofins
+              FOR ALL
+              TO service_role
+              USING (true)
+              WITH CHECK (true);
+
+          Alternativamente, se preferir desabilitar RLS nesta tabela:
+            ALTER TABLE normas_legais_pis_cofins DISABLE ROW LEVEL SECURITY;
+
+v3.13 — Correção tabela de normas PIS/COFINS (2026-03-22).
         • CORRIGIDO: tabela de normas para produtos monofásicos renomeada de
           'normas_legais' para 'normas_legais_pis_cofins' — alinhado com a
           nova arquitetura que separa normas por regime tributário:
@@ -105,7 +129,7 @@ try:
     HAS_GDRIVE = True
 except: HAS_GDRIVE = False
 
-app = FastAPI(title="Extrator Fiscal v3.13", version="3.13.0")
+app = FastAPI(title="Extrator Fiscal v3.14", version="3.14.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -178,11 +202,20 @@ RE_LEI_XLSX = re.compile(
 )
 
 
-def _ano4(ano_str: str) -> int:
-    """Converte ano de 2 dígitos para 4 dígitos (98 → 1998, 03 → 2003)."""
-    a = int(ano_str)
+def _ano4(ano_str: str) -> int | None:
+    """
+    Converte ano de 2 dígitos para 4 dígitos (98 → 1998, 03 → 2003).
+    Retorna None se o ano resultante estiver fora do intervalo válido 1988-2026,
+    evitando capturar números de artigos como anos (ex: "art. 2º" → ano=2).
+    """
+    try:
+        a = int(ano_str)
+    except (ValueError, TypeError):
+        return None
     if a < 100:
-        return 1900 + a if a >= 88 else 2000 + a
+        a = 1900 + a if a >= 88 else 2000 + a
+    if not (1988 <= a <= 2026):
+        return None
     return a
 
 
@@ -380,6 +413,8 @@ def _extrair_normas_de_base_legal(base_legal: str) -> list[dict]:
 
     def _registrar(tipo, numero, ano_str, trecho):
         ano = _ano4(ano_str)
+        if ano is None:
+            return  # ano fora do intervalo válido — ignora
         numero = numero.strip().rstrip(".")
         chave  = _chave_norma(tipo, numero, ano)
         if chave not in normas:
@@ -420,25 +455,34 @@ def _lei_curta_de_base_legal(base_legal: str) -> str | None:
     """
     Retorna a primeira norma encontrada em formato curto para o campo `lei`.
     Ex: "Lei 10.147/2000" ou "LC 192/2022" ou "Decreto 8.395/2015".
+    Retorna None se o ano encontrado for inválido (fora de 1988-2026).
     """
     if not base_legal:
         return None
 
     m = RE_LC_MONO.search(base_legal)
     if m:
-        return f"LC {m.group(1)}/{_ano4(m.group(2))}"
+        ano = _ano4(m.group(2))
+        if ano:
+            return f"LC {m.group(1)}/{ano}"
 
     m = RE_LEI_MONO.search(base_legal)
     if m:
-        return f"Lei {m.group(1)}/{_ano4(m.group(2))}"
+        ano = _ano4(m.group(2))
+        if ano:
+            return f"Lei {m.group(1)}/{ano}"
 
     m = RE_DEC_MONO.search(base_legal)
     if m:
-        return f"Decreto {m.group(1)}/{_ano4(m.group(2))}"
+        ano = _ano4(m.group(2))
+        if ano:
+            return f"Decreto {m.group(1)}/{ano}"
 
     m = RE_MP_MONO.search(base_legal)
     if m:
-        return f"MP {m.group(1)}/{_ano4(m.group(2))}"
+        ano = _ano4(m.group(2))
+        if ano:
+            return f"MP {m.group(1)}/{ano}"
 
     return None
 
@@ -1033,7 +1077,7 @@ _FUNDAMENTACAO_LOOKUP: dict = _carregar_lookup_fundamentacao()
 
 def health():
     return {
-        "status": "ok", "versao": "3.13.0",
+        "status": "ok", "versao": "3.14.0",
         "supabase": supabase is not None,
         "pdf": HAS_PDF, "xlsx": HAS_XLSX, "docx": HAS_DOCX, "gdrive": HAS_GDRIVE,
         "tabela_normas_mono":  TABELA_NORMAS_MONO,
